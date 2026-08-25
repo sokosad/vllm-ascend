@@ -104,6 +104,7 @@ class EplbUpdator:
         self.update_plan_active = False
         self.layer_update_pending = False
         self.awaiting_plan = False
+        self.pending_update_info = None
 
         self.cur_iterations: torch.int64 = 0
 
@@ -126,6 +127,7 @@ class EplbUpdator:
             self.cur_iterations = 0
             self.update_plan_active = False
             self.awaiting_plan = False
+            self.pending_update_info = None
 
     def get_update_info_flag(self):
         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
@@ -145,15 +147,32 @@ class EplbUpdator:
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
         if self.get_update_info_flag() or self.awaiting_plan:
-            try:
-                self.update_info_all = self.eplb_process.block_update_q.get_nowait()
-            except Empty:
-                if not self.process.is_alive():
-                    raise RuntimeError(
-                        "EPLB planner exited before publishing an update plan"
-                    )
+            planner_state = 1
+            if self.pending_update_info is None:
+                try:
+                    self.pending_update_info = self.eplb_process.block_update_q.get_nowait()
+                except Empty:
+                    planner_state = 0 if self.process.is_alive() else -1
+
+            readiness = torch.tensor(
+                [planner_state], dtype=torch.int32, device=self.device
+            )
+            dist.all_reduce(
+                readiness,
+                op=dist.ReduceOp.MIN,
+                group=self.comm_group.device_group,
+            )
+            global_state = int(readiness.item())
+            if global_state < 0:
+                raise RuntimeError(
+                    "An EPLB planner exited before publishing an update plan"
+                )
+            if global_state == 0:
                 self.awaiting_plan = True
                 return
+
+            self.update_info_all = self.pending_update_info
+            self.pending_update_info = None
             self.awaiting_plan = False
             self.update_plan_active = bool(self.update_info_all)
         if self.update_expert_weight_flag() and self.update_plan_active:
