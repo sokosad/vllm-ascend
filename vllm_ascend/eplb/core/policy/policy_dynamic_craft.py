@@ -15,7 +15,6 @@ from .policy_craft import build_craft_placement, replay_balancedness
 
 _MIN_GAIN_ENV = "VLLM_ASCEND_DYNAMIC_CRAFT_MIN_GAIN"
 _MAX_APPLIES_ENV = "VLLM_ASCEND_DYNAMIC_CRAFT_MAX_APPLIES"
-_INCUMBENT_GAIN_TOLERANCE = 0.01
 _PER_LAYER_GAIN_EPSILON = 1e-12
 
 
@@ -213,11 +212,12 @@ class DynamicCraftPlanner:
                     table, self.pending, current_by_layer, heat, num_experts
                 )
             )
-            if (
-                pending_ready
-                and float(fresh_gain_by_layer.mean() - pending_gains.mean())
-                <= _INCUMBENT_GAIN_TOLERANCE
-            ):
+            # Stability means that the incumbent remains beneficial under a
+            # fresh load window, not that a deterministic optimizer reproduces
+            # the same placement. Chasing every newly optimal placement keeps
+            # resetting the streak on otherwise stable traffic and can prevent
+            # EPLB from ever applying a valid plan.
+            if pending_ready:
                 self.pending_streak += 1
                 selected = self.pending
                 selected_ready = True
