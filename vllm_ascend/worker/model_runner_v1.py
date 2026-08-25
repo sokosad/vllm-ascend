@@ -122,7 +122,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
-from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.eplb.eplb_updator import EplbUpdator, ensure_dynamic_eplb_graph_safe
 from vllm_ascend.eplb.utils import model_register
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
@@ -488,6 +488,11 @@ class NPUModelRunner(GPUModelRunner):
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
+        ensure_dynamic_eplb_graph_safe(
+            self.dynamic_eplb,
+            self.compilation_config.cudagraph_mode,
+            eplb_config.allow_dynamic_eplb_full_decode_only,
+        )
         self.eplb_enable = self.dynamic_eplb or (eplb_config.expert_map_path is not None)
         if self.dynamic_eplb:
             self.is_eplb_warmuped = False
@@ -498,6 +503,10 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
+            self.eplb_updator.configure_graph_mode(
+                self.compilation_config.cudagraph_mode,
+                eplb_config.allow_dynamic_eplb_full_decode_only,
+            )
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in

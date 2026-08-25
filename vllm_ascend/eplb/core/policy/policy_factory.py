@@ -4,6 +4,7 @@ from vllm.logger import logger
 
 from .policy_abstract import EplbPolicy
 from .policy_default_eplb import DefaultEplb
+from .policy_dynamic_craft import DynamicCraftEplb
 from .policy_flashlb import FlashLB, warm_up
 from .policy_random import RandomLoadBalance
 from .policy_swift_balancer import SwiftBalanceEplb
@@ -24,6 +25,7 @@ class PolicyFactory:
             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
             # Multi-Shot Enhancement and Incremental Adjustment
             3: FlashLB,
+            4: DynamicCraftEplb,
         }
         policy_class = policy.get(policy_type)
         if policy_class is None:

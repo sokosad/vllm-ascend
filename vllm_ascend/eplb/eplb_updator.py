@@ -15,10 +15,13 @@
 # This file is a part of the vllm-ascend project.
 #
 # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this updator.
+from queue import Empty
+
 import numpy
 import torch
 import torch.distributed as dist
 import vllm.envs as envs
+from vllm.config import CUDAGraphMode
 from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -26,6 +29,23 @@ from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+
+
+def ensure_dynamic_eplb_graph_safe(
+    dynamic_eplb: bool,
+    cudagraph_mode: CUDAGraphMode,
+    allow_full_decode_only: bool = True,
+) -> None:
+    if not dynamic_eplb or cudagraph_mode == CUDAGraphMode.NONE:
+        return
+    if (
+        allow_full_decode_only
+        and cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    ):
+        return
+    raise ValueError(
+        "Dynamic EPLB supports eager or FULL_DECODE_ONLY graph mode only."
+    )
 
 
 class EplbUpdator:
@@ -37,6 +57,22 @@ class EplbUpdator:
         self.eplb_process = eplb_process
         self.shared_dict = self.eplb_process.shared_dict
         self.comm_group = get_dynamic_eplb_group()
+        self._full_decode_only_graph_barrier_enabled = False
+
+    def configure_graph_mode(
+        self, cudagraph_mode: CUDAGraphMode, allow_full_decode_only: bool
+    ) -> None:
+        ensure_dynamic_eplb_graph_safe(
+            True, cudagraph_mode, allow_full_decode_only
+        )
+        self._full_decode_only_graph_barrier_enabled = (
+            allow_full_decode_only
+            and cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+
+    def _synchronize_full_decode_only_graph(self) -> None:
+        if self._full_decode_only_graph_barrier_enabled:
+            torch.npu.current_stream().synchronize()
 
     def set_adaptor(self, adaptor: VllmEplbAdaptor):
         self.adaptor = adaptor
@@ -65,6 +101,9 @@ class EplbUpdator:
 
         self.reqs = []
         self.update_info_all = []
+        self.update_plan_active = False
+        self.layer_update_pending = False
+        self.awaiting_plan = False
 
         self.cur_iterations: torch.int64 = 0
 
@@ -85,6 +124,8 @@ class EplbUpdator:
 
             self.adaptor.model.clear_all_moe_loads()
             self.cur_iterations = 0
+            self.update_plan_active = False
+            self.awaiting_plan = False
 
     def get_update_info_flag(self):
         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
@@ -103,10 +144,21 @@ class EplbUpdator:
 
     def forward_before(self):
         # Batch after eplb process being triggered, get update info provided by eplb process
-        if self.get_update_info_flag():
-            self.update_info_all = self.eplb_process.block_update_q.get()
-        if self.update_expert_weight_flag():
+        if self.get_update_info_flag() or self.awaiting_plan:
+            try:
+                self.update_info_all = self.eplb_process.block_update_q.get_nowait()
+            except Empty:
+                if not self.process.is_alive():
+                    raise RuntimeError(
+                        "EPLB planner exited before publishing an update plan"
+                    )
+                self.awaiting_plan = True
+                return
+            self.awaiting_plan = False
+            self.update_plan_active = bool(self.update_info_all)
+        if self.update_expert_weight_flag() and self.update_plan_active:
             with record_function_or_nullcontext("EPLB generate p2p task"):
+                self._synchronize_full_decode_only_graph()
                 (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
                     self.update_info_all.pop(0)
                 )
@@ -123,6 +175,7 @@ class EplbUpdator:
                 # set asynchronous stream for d2d expert weight update
                 self.reqs = []
                 self.eplb_loader.asyn_expert_weight_transfer(self.reqs)
+                self.layer_update_pending = True
 
     def forward_end(self):
         if self.wakeup_eplb_worker_flag():
@@ -130,10 +183,14 @@ class EplbUpdator:
                 self.compute_and_set_moe_load()
                 self.wakeup_eplb_worker()
 
-        if self.update_expert_weight_flag() and self.expert_map_record_path is None:
+        if self.layer_update_pending and self.expert_map_record_path is None:
+            self._synchronize_full_decode_only_graph()
             self.eplb_loader.update_expert_map_and_weight(self.reqs)
+            self.layer_update_pending = False
+            self._synchronize_full_decode_only_graph()
 
-        self.update_iteration()
+        if not self.awaiting_plan:
+            self.update_iteration()
 
     def compute_and_set_moe_load(self):
         local_load = self.adaptor.get_rank_expert_workload().unsqueeze(1)

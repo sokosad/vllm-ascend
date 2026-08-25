@@ -717,6 +717,7 @@ class EplbConfig:
 
     _defaults = {
         "dynamic_eplb": False,
+        "allow_dynamic_eplb_full_decode_only": True,
         "expert_map_path": None,
         "expert_heat_collection_interval": 400,
         "algorithm_execution_interval": 30,
@@ -761,8 +762,17 @@ class EplbConfig:
                 raise TypeError(f"{key} must be an integer")
             if self.config[key] < 0:  # type: ignore
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
-        if self.eplb_policy_type not in [0, 1, 2, 3]:
-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if type(self.allow_dynamic_eplb_full_decode_only) is not bool:
+            raise TypeError("allow_dynamic_eplb_full_decode_only must be a boolean")
+        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
+            raise ValueError("eplb_policy_type must be in [0, 1, 2, 3, 4]")
+        if self.eplb_policy_type == 4:
+            if not self.dynamic_eplb:
+                raise ValueError("Policy4 requires dynamic_eplb")
+            if self.expert_map_path is not None:
+                raise ValueError("Dynamic Policy4 cannot use expert_map_path")
+            if self.num_redundant_experts <= 0:
+                raise ValueError("Dynamic Policy4 requires redundant experts")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
