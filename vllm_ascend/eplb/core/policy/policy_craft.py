@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from itertools import combinations
 from typing import Literal, Sequence
 
@@ -37,55 +36,6 @@ def _strict_integer_array(value: object, name: str, *, ndim: int | None = None) 
     return result.astype(np.int64, copy=False)
 
 
-@dataclass(frozen=True)
-class CraftBenefitEstimate:
-    """Replay result for the common set of per-layer replica candidates."""
-
-    candidate_replicas: np.ndarray
-    balancedness_by_candidate: np.ndarray
-    benefit_by_candidate: np.ndarray
-    placement_only_balancedness: np.ndarray
-
-
-@dataclass(frozen=True)
-class CraftPlan:
-    """A complete CRAFT replication and placement plan.
-
-    Replica counts are cluster-global additional physical copies.  Capacities
-    include the original experts and are expressed per layer and rank.
-    """
-
-    replica_count_by_layer: np.ndarray
-    capacity_by_layer_rank: np.ndarray
-    placement_by_layer_rank: Placement
-    physical_to_logical: tuple[np.ndarray, ...]
-    physical_to_rank: tuple[np.ndarray, ...]
-    logical_copy_count: np.ndarray
-    baseline_balancedness: np.ndarray
-    predicted_balancedness: np.ndarray
-    benefit_by_layer: np.ndarray
-    candidate_replicas: np.ndarray
-    balancedness_by_candidate: np.ndarray
-    benefit_by_candidate: np.ndarray
-    metadata: dict[str, object]
-
-    @property
-    def layer_replicas(self) -> np.ndarray:
-        return self.replica_count_by_layer
-
-    @property
-    def rank_capacities(self) -> np.ndarray:
-        return self.capacity_by_layer_rank
-
-    @property
-    def placement(self) -> Placement:
-        return self.placement_by_layer_rank
-
-    @property
-    def benefit(self) -> np.ndarray:
-        return self.benefit_by_layer
-
-
 def _normalise_load(expert_load: np.ndarray | Sequence[object]) -> tuple[np.ndarray, bool]:
     raw_load = np.asarray(expert_load)
     if raw_load.dtype == np.bool_:
@@ -106,61 +56,6 @@ def _normalise_load(expert_load: np.ndarray | Sequence[object]) -> tuple[np.ndar
     if np.any(load < 0):
         raise ValueError("expert_load must be non-negative")
     return load, input_was_batched
-
-
-def default_replica_candidates(
-    num_ranks: int,
-    *,
-    runtime_aligned: bool = False,
-) -> np.ndarray:
-    """Return paper candidates: powers of two over [1, D], including D.
-
-    ``runtime_aligned`` restricts candidates to multiples of ``num_ranks``.
-    With the paper's upper bound of D this leaves only D, which is useful for
-    runtimes that require an equal number of local slots on every rank.
-    """
-
-    num_ranks = _strict_integer(num_ranks, "num_ranks", minimum=1)
-    candidates: list[int] = []
-    value = 1
-    while value <= num_ranks:
-        candidates.append(value)
-        value *= 2
-    if candidates[-1] != num_ranks:
-        candidates.append(num_ranks)
-    if runtime_aligned:
-        candidates = [value for value in candidates if value % num_ranks == 0]
-    return np.asarray(sorted(set(candidates)), dtype=np.int64)
-
-
-def _normalise_candidates(
-    candidate_replicas: Sequence[int] | np.ndarray | None,
-    num_ranks: int,
-    runtime_aligned: bool,
-) -> np.ndarray:
-    if candidate_replicas is None:
-        candidates = default_replica_candidates(
-            num_ranks,
-            runtime_aligned=runtime_aligned,
-        )
-    else:
-        raw = np.asarray(candidate_replicas)
-        if raw.ndim != 1:
-            raise ValueError("candidate_replicas must be a one-dimensional sequence")
-        if raw.dtype == np.bool_ or not np.issubdtype(raw.dtype, np.integer):
-            raise TypeError("candidate_replicas must contain only integers")
-        values: list[int] = []
-        for value in raw.tolist():
-            integer = _strict_integer(value, "candidate_replicas entry", minimum=1)
-            if not runtime_aligned or integer % num_ranks == 0:
-                values.append(integer)
-        candidates = np.asarray(sorted(set(values)), dtype=np.int64)
-    if candidates.size == 0:
-        raise ValueError(
-            "no replica candidate remains; runtime_aligned candidates must "
-            f"be multiples of num_ranks={num_ranks}"
-        )
-    return candidates
 
 
 def capacity_aware_interleaving(
