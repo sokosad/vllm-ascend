@@ -57,11 +57,14 @@ class EplbWorker:
         load_info = self.fetch_and_sum_load_info()
         if load_info is None:
             logger.debug("[eplb/worker] No moe_load data available yet, skipping this cycle")
-            return
+            return []
 
         # Get the updated expert table based on the workload information
         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
-        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+        changed, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+        if not changed:
+            logger.debug("[eplb/worker] Policy returned an unchanged placement")
+            return []
 
         if self.rank_id == 0:
             if self.multi_stage:
@@ -96,6 +99,9 @@ class EplbWorker:
             new_placement = torch.tensor(new_placement)
         self.check_expert_placement(old_placement, new_placement)
         new_expert_maps = self.local2global(new_placement)
+        if torch.equal(new_expert_maps, self.old_expert_maps):
+            logger.debug("[eplb/worker] Validated placement is unchanged")
+            return []
         self.update_expert_map(new_expert_maps)
 
         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
@@ -162,6 +168,7 @@ class EplbWorker:
                     updated_expert_maps_this_layer,
                     layer_id,
                 )
+                continue
 
             # Parse expert_ids each rank needs to receive from other ranks
             dst_rank_indices, experts_to_recv = torch.where(

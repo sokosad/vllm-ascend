@@ -522,6 +522,17 @@ class NPUPlatform(Platform):
                 logger.info("Falling back to FULL_DECODE_ONLY under xlite decode-only mode")
                 compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
+        if (
+            ascend_config.eplb_config.dynamic_eplb
+            and compilation_config.cudagraph_mode
+            not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY)
+        ):
+            logger.info(
+                "Dynamic EPLB requires mutable expert maps; falling back to "
+                "FULL_DECODE_ONLY graph mode"
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
         if enforce_eager:
             logger.info("Compilation disabled, using eager mode by default")
             compilation_config.mode = CompilationMode.NONE
