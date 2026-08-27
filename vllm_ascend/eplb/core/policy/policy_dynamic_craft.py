@@ -16,6 +16,7 @@ from .policy_craft import build_craft_placement, replay_balancedness
 _MIN_GAIN_ENV = "VLLM_ASCEND_DYNAMIC_CRAFT_MIN_GAIN"
 _MAX_APPLIES_ENV = "VLLM_ASCEND_DYNAMIC_CRAFT_MAX_APPLIES"
 _PER_LAYER_GAIN_EPSILON = 1e-12
+_MAX_MIGRATION_LAYER_FRACTION = 0.25
 
 
 @dataclass(frozen=True)
@@ -143,6 +144,37 @@ class DynamicCraftPlanner:
             heat, *_placement_maps(table, num_experts), table.shape[1]
         )
 
+    @classmethod
+    def _limit_migration_scope(
+        cls,
+        current: np.ndarray,
+        candidate: np.ndarray,
+        current_score: np.ndarray,
+        heat: np.ndarray,
+        num_experts: int,
+    ) -> np.ndarray:
+        changed_by_layer = np.count_nonzero(candidate != current, axis=(1, 2))
+        changed_layers = np.flatnonzero(changed_by_layer)
+        max_layers = max(
+            1,
+            int(np.ceil(current.shape[0] * _MAX_MIGRATION_LAYER_FRACTION)),
+        )
+        if changed_layers.size <= max_layers:
+            return candidate
+
+        gain_by_layer = cls._scores(candidate, heat, num_experts) - current_score
+        selected_layers = sorted(
+            changed_layers.tolist(),
+            key=lambda layer: (
+                -float(gain_by_layer[layer] / changed_by_layer[layer]),
+                -float(gain_by_layer[layer]),
+                layer,
+            ),
+        )[:max_layers]
+        limited = current.copy()
+        limited[selected_layers] = candidate[selected_layers]
+        return limited
+
     def _eligible(
         self,
         current: np.ndarray,
@@ -180,6 +212,13 @@ class DynamicCraftPlanner:
                 heat, np.full(table.shape[0], replicas), table.shape[1]
             )
             candidate = _align_retained_slots(table, desired)
+            candidate = self._limit_migration_scope(
+                table,
+                candidate,
+                current_by_layer,
+                heat,
+                num_experts,
+            )
 
         fresh_ready, fresh_gain_by_layer, fresh_score, fresh_changed = self._eligible(
             table, candidate, current_by_layer, heat, num_experts
