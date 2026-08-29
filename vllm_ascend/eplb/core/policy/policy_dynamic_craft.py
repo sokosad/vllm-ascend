@@ -91,6 +91,50 @@ def _placement_maps(table: np.ndarray, num_experts: int):
     return tuple(phy2log), tuple(phy2rank), copies
 
 
+def _placement_risk_by_layer(
+    current: np.ndarray,
+    candidate: np.ndarray,
+    heat: np.ndarray,
+    num_experts: int,
+) -> np.ndarray:
+    """Estimate migration and communication-locality risk per layer.
+
+    The runtime currently exposes logical-expert heat, but not a
+    source-rank-to-expert traffic matrix.  Retaining the current owners of hot
+    experts is therefore the safest available locality proxy.  Peak per-rank
+    slot churn additionally avoids concentrating weight transfers on one rank.
+    """
+    changed = candidate != current
+    mean_rank_churn = changed.mean(axis=(1, 2))
+    peak_rank_churn = changed.mean(axis=2).max(axis=1)
+
+    current_owners = np.zeros(
+        (current.shape[0], num_experts, current.shape[1]), dtype=bool
+    )
+    candidate_owners = np.zeros_like(current_owners)
+    for layer in range(current.shape[0]):
+        for rank in range(current.shape[1]):
+            current_owners[layer, current[layer, rank], rank] = True
+            candidate_owners[layer, candidate[layer, rank], rank] = True
+
+    current_copies = current_owners.sum(axis=2)
+    retired_owner_fraction = np.divide(
+        np.count_nonzero(current_owners & ~candidate_owners, axis=2),
+        current_copies,
+        out=np.zeros_like(current_copies, dtype=np.float64),
+        where=current_copies != 0,
+    )
+    total_heat = heat.sum(axis=1)
+    hot_owner_churn = np.divide(
+        (heat * retired_owner_fraction).sum(axis=1),
+        total_heat,
+        out=np.zeros_like(total_heat, dtype=np.float64),
+        where=total_heat != 0,
+    )
+
+    return (mean_rank_churn + peak_rank_churn + hot_owner_churn) / 3.0
+
+
 def _align_retained_slots(current: np.ndarray, desired) -> np.ndarray:
     result = np.full_like(current, -1)
     for layer in range(current.shape[0]):
@@ -152,21 +196,40 @@ class DynamicCraftPlanner:
         current_score: np.ndarray,
         heat: np.ndarray,
         num_experts: int,
+        amortization_horizon: float,
+        migration_cost: float,
     ) -> np.ndarray:
         changed_by_layer = np.count_nonzero(candidate != current, axis=(1, 2))
         changed_layers = np.flatnonzero(changed_by_layer)
+        if changed_layers.size == 0:
+            return candidate
+
+        gain_by_layer = cls._scores(candidate, heat, num_experts) - current_score
+        risk_by_layer = _placement_risk_by_layer(
+            current, candidate, heat, num_experts
+        )
+        net_gain_by_layer = (
+            gain_by_layer * amortization_horizon
+            - risk_by_layer * migration_cost
+        )
+        profitable_layers = changed_layers[
+            net_gain_by_layer[changed_layers] > _PER_LAYER_GAIN_EPSILON
+        ]
+        if profitable_layers.size == 0:
+            return current.copy()
+
         max_layers = max(
             1,
             int(np.ceil(current.shape[0] * _MAX_MIGRATION_LAYER_FRACTION)),
         )
-        if changed_layers.size <= max_layers:
-            return candidate
-
-        gain_by_layer = cls._scores(candidate, heat, num_experts) - current_score
         selected_layers = sorted(
-            changed_layers.tolist(),
+            profitable_layers.tolist(),
             key=lambda layer: (
-                -float(gain_by_layer[layer] / changed_by_layer[layer]),
+                -float(net_gain_by_layer[layer]),
+                -float(
+                    gain_by_layer[layer]
+                    / max(risk_by_layer[layer], _PER_LAYER_GAIN_EPSILON)
+                ),
                 -float(gain_by_layer[layer]),
                 layer,
             ),
@@ -187,7 +250,10 @@ class DynamicCraftPlanner:
         per_layer_gain = predicted - current_score
         gain = float(per_layer_gain.mean())
         changed = int(np.count_nonzero(candidate != current))
-        cost = changed / current.size * self.migration_cost
+        placement_risk = _placement_risk_by_layer(
+            current, candidate, heat, num_experts
+        )
+        cost = float(placement_risk.mean()) * self.migration_cost
         ready = (
             changed > 0
             and gain >= self.min_gain
@@ -218,6 +284,8 @@ class DynamicCraftPlanner:
                 current_by_layer,
                 heat,
                 num_experts,
+                self.amortization_horizon,
+                self.migration_cost,
             )
 
         fresh_ready, fresh_gain_by_layer, fresh_score, fresh_changed = self._eligible(
@@ -294,9 +362,16 @@ class DynamicCraftPlanner:
         elif capped:
             reason = "max-applies"
 
+        selected_risk_by_layer = _placement_risk_by_layer(
+            table, selected, heat, num_experts
+        )
+        selected_net_gain_by_layer = (
+            selected_gain_by_layer * self.amortization_horizon
+            - selected_risk_by_layer * self.migration_cost
+        )
         priority = tuple(
             int(value)
-            for value in np.argsort(-selected_gain_by_layer, kind="stable")
+            for value in np.argsort(-selected_net_gain_by_layer, kind="stable")
         )
         return DynamicCraftDecision(
             should_apply=should_apply,
