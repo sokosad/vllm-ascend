@@ -12,7 +12,9 @@ from .policy_swift_balancer import SwiftBalanceEplb
 
 class PolicyFactory:
     @staticmethod
-    def generate_policy(policy_type: int) -> EplbPolicy:
+    def generate_policy(
+        policy_type: int, policy_config: dict | None = None
+    ) -> EplbPolicy:
         policy: dict[int, type[EplbPolicy]] = {
             # Constraint applying Dynamic EPLB policy V2:
             # If there exists redundant expert:
@@ -37,7 +39,10 @@ class PolicyFactory:
             )
         else:
             logger.info("[eplb/policy] Policy: %s (type=%s)", policy_class.__name__, policy_type)
-        policy_instance = policy_class()
+        if policy_type == 4:
+            policy_instance = policy_class(**(policy_config or {}))
+        else:
+            policy_instance = policy_class()
         if policy_type == 3:
             warm_up()
         return policy_instance

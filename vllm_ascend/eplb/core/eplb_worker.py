@@ -27,9 +27,15 @@ from vllm_ascend.eplb.core.policy.policy_factory import PolicyFactory
 
 
 class EplbWorker:
-    def __init__(self, shared_dict, policy_type, enable_d2d: bool = True):
+    def __init__(
+        self,
+        shared_dict,
+        policy_type,
+        enable_d2d: bool = True,
+        policy_config: dict | None = None,
+    ):
         self.policy_type = policy_type
-        self.policy = PolicyFactory.generate_policy(policy_type)
+        self.policy = PolicyFactory.generate_policy(policy_type, policy_config)
         self.shared_dict = shared_dict
         self.old_expert_maps = None
         self.enable_d2d = enable_d2d
@@ -330,21 +336,34 @@ class EplbWorker:
 
 
 class EplbProcess:
-    def __init__(self, shared_dict, policy_type: int = 0, enable_d2d: bool = True):
+    def __init__(
+        self,
+        shared_dict,
+        policy_type: int = 0,
+        enable_d2d: bool = True,
+        policy_config: dict | None = None,
+    ):
         """
         Args:
             shared_dict: Cross-process shared dict returned by Manager().dict()
             policy_type: Integer passed to PolicyFactory.generate_policy
             enable_d2d: Whether to enable D2D loading
+            policy_config: Optional constructor parameters for the policy
         """
         self.shared_dict = shared_dict
         self.policy_type = policy_type
         self.enable_d2d = enable_d2d
+        self.policy_config = policy_config
         self.planner_q: Queue[Any] = Queue()
         self.block_update_q: Queue[Any] = Queue(maxsize=1)
 
         # Create EplbWorker instance
-        self.worker = EplbWorker(self.shared_dict, self.policy_type, self.enable_d2d)
+        self.worker = EplbWorker(
+            self.shared_dict,
+            self.policy_type,
+            self.enable_d2d,
+            self.policy_config,
+        )
 
     def worker_process(self, planner_q, block_update_q):
         """

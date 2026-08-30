@@ -166,11 +166,27 @@ class DynamicCraftPlanner:
         cooldown_windows: int = 1,
         amortization_horizon: float = 4.0,
         migration_cost: float = 0.02,
+        min_gain: float | None = None,
+        max_applies: int | None = None,
+        num_redundant_experts: int | None = None,
     ) -> None:
         if stable_windows < 1 or cooldown_windows < 0:
             raise ValueError("invalid Policy4 stability settings")
-        self.min_gain = _env_min_gain()
-        self.max_applies = _env_max_applies()
+        self.min_gain = _env_min_gain() if min_gain is None else float(min_gain)
+        self.max_applies = (
+            _env_max_applies() if max_applies is None else int(max_applies)
+        )
+        if not 0 < self.min_gain < 1:
+            raise ValueError("min_gain must be in (0, 1)")
+        if self.max_applies is not None and self.max_applies < 0:
+            raise ValueError("max_applies must be non-negative")
+        self.num_redundant_experts = num_redund_experts = (
+            None
+            if num_redundant_experts is None
+            else int(num_redundant_experts)
+        )
+        if num_redund_experts is not None and num_redund_experts <= 0:
+            raise ValueError("num_redundant_experts must be positive")
         self.stable_windows = stable_windows
         self.cooldown_windows = cooldown_windows
         self.amortization_horizon = float(amortization_horizon)
@@ -268,6 +284,15 @@ class DynamicCraftPlanner:
         heat = _logical_heat(table, load, num_experts)
         current_by_layer = self._scores(table, heat, num_experts)
         replicas = table.shape[1] * table.shape[2] - num_experts
+        if (
+            self.num_redundant_experts is not None
+            and replicas != self.num_redundant_experts
+        ):
+            raise ValueError(
+                "Policy4 runtime placement has "
+                f"{replicas} redundant experts, expected "
+                f"{self.num_redundant_experts} from configuration"
+            )
         reason = "awaiting-stable-window"
 
         if replicas <= 0:
@@ -387,8 +412,8 @@ class DynamicCraftPlanner:
 
 
 class DynamicCraftEplb(EplbPolicy):
-    def __init__(self) -> None:
-        self.planner = DynamicCraftPlanner()
+    def __init__(self, **planner_config) -> None:
+        self.planner = DynamicCraftPlanner(**planner_config)
         self.last_decision: DynamicCraftDecision | None = None
 
     def rebalance_experts(self, current_expert_table, expert_workload):

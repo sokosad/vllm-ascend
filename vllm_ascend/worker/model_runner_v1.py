@@ -500,7 +500,25 @@ class NPUModelRunner(GPUModelRunner):
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
             self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
-            self.eplb_process = EplbProcess(shared_dict=self.shared_dict, policy_type=self.policy_type, enable_d2d=True)
+            policy_config = None
+            if self.policy_type == 4:
+                policy_config = {
+                    "num_redundant_experts": eplb_config.num_redundant_experts,
+                    "min_gain": eplb_config.policy4_min_gain,
+                    "max_applies": eplb_config.policy4_max_applies,
+                    "stable_windows": eplb_config.policy4_stable_windows,
+                    "cooldown_windows": eplb_config.policy4_cooldown_windows,
+                    "amortization_horizon": (
+                        eplb_config.policy4_amortization_horizon
+                    ),
+                    "migration_cost": eplb_config.policy4_migration_cost,
+                }
+            self.eplb_process = EplbProcess(
+                shared_dict=self.shared_dict,
+                policy_type=self.policy_type,
+                enable_d2d=True,
+                policy_config=policy_config,
+            )
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
             self.eplb_updator.configure_graph_mode(

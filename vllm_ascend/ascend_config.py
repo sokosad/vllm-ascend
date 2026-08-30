@@ -724,6 +724,12 @@ class EplbConfig:
         "expert_map_record_path": None,
         "num_redundant_experts": 0,
         "eplb_policy_type": 1,
+        "policy4_min_gain": None,
+        "policy4_max_applies": None,
+        "policy4_stable_windows": 2,
+        "policy4_cooldown_windows": 1,
+        "policy4_amortization_horizon": 4.0,
+        "policy4_migration_cost": 0.02,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -773,6 +779,44 @@ class EplbConfig:
                 raise ValueError("Dynamic Policy4 cannot use expert_map_path")
             if self.num_redundant_experts <= 0:
                 raise ValueError("Dynamic Policy4 requires redundant experts")
+            for key, minimum in (
+                ("policy4_stable_windows", 1),
+                ("policy4_cooldown_windows", 0),
+            ):
+                value = self.config[key]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError(f"{key} must be an integer")
+                if value < minimum:
+                    raise ValueError(f"{key} must be at least {minimum}")
+            min_gain = self.policy4_min_gain
+            if min_gain is not None:
+                if isinstance(min_gain, bool) or not isinstance(
+                    min_gain, (int, float)
+                ):
+                    raise TypeError("policy4_min_gain must be numeric or None")
+                if not 0 < min_gain < 1:
+                    raise ValueError("policy4_min_gain must be in (0, 1)")
+            max_applies = self.policy4_max_applies
+            if max_applies is not None:
+                if isinstance(max_applies, bool) or not isinstance(
+                    max_applies, int
+                ):
+                    raise TypeError(
+                        "policy4_max_applies must be an integer or None"
+                    )
+                if max_applies < 0:
+                    raise ValueError("policy4_max_applies must be non-negative")
+            for key, allow_zero in (
+                ("policy4_amortization_horizon", False),
+                ("policy4_migration_cost", True),
+            ):
+                value = self.config[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise TypeError(f"{key} must be numeric")
+                lower_bound_ok = value >= 0 if allow_zero else value > 0
+                if not lower_bound_ok or value >= float("inf"):
+                    relation = "non-negative" if allow_zero else "positive"
+                    raise ValueError(f"{key} must be finite and {relation}")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
