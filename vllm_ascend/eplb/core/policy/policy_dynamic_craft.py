@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass
 
 import numpy as np
+
+from vllm_ascend import envs
 
 from .policy_abstract import EplbPolicy
 from .policy_craft import build_craft_placement, replay_balancedness
@@ -33,19 +33,19 @@ class DynamicCraftDecision:
 
 
 def _env_min_gain() -> float:
-    value = float(os.environ.get(_MIN_GAIN_ENV, "0.02"))
+    value = float(envs.VLLM_ASCEND_DYNAMIC_CRAFT_MIN_GAIN)
     if not np.isfinite(value) or not 0 < value < 1:
         raise ValueError(f"{_MIN_GAIN_ENV} must satisfy 0 < value < 1")
     return value
 
 
 def _env_max_applies() -> int | None:
-    raw = os.environ.get(_MAX_APPLIES_ENV)
-    if raw is None:
+    value = envs.VLLM_ASCEND_DYNAMIC_CRAFT_MAX_APPLIES
+    if value is None:
         return None
-    if re.fullmatch(r"[0-9]+", raw) is None:
+    if value < 0:
         raise ValueError(f"{_MAX_APPLIES_ENV} must be a non-negative integer")
-    return int(raw)
+    return int(value)
 
 
 def _numpy(value, dtype) -> np.ndarray:

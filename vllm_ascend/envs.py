@@ -92,6 +92,19 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # Minimum mean balancedness gain required before Policy4 migrates experts.
+    # This is a non-sensitive floating-point value in the open interval (0, 1).
+    "VLLM_ASCEND_DYNAMIC_CRAFT_MIN_GAIN": lambda: float(
+        os.getenv("VLLM_ASCEND_DYNAMIC_CRAFT_MIN_GAIN", "0.02")
+    ),
+    # Optional non-negative cap on the number of Policy4 migrations per process.
+    # This value is not sensitive; leaving it unset disables the cap.
+    "VLLM_ASCEND_DYNAMIC_CRAFT_MAX_APPLIES": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_ASCEND_DYNAMIC_CRAFT_MAX_APPLIES"))
+        is not None
+        else None
+    ),
     # Whether to enable fused MC2 (`dispatch_gmm_combine_decode` / `dispatch_ffn_combine`).
     # 0, or not set: default ALLTOALL and MC2 will be used.
     # 1: ALLTOALL and MC2 might be replaced by `dispatch_ffn_combine` operator.
