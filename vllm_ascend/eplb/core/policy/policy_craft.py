@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-from itertools import combinations
 from typing import Literal, Sequence
 
 import numpy as np
@@ -267,89 +266,19 @@ def _residual_placement_is_feasible(
         needed = int(logical[logical_id])
         residual_logical = logical.copy()
         residual_logical[logical_id] = 0
-        preferred = tuple(
-            sorted(
-                available,
-                key=lambda rank_id: (-int(ranks[rank_id]), rank_id),
-            )[:needed]
-        )
+        preferred = sorted(
+            available,
+            key=lambda rank_id: (-int(ranks[rank_id]), rank_id),
+        )[:needed]
         residual_ranks = ranks.copy()
-        residual_ranks[list(preferred)] -= 1
-        if _complete_degree_sequence_is_feasible(
+        residual_ranks[preferred] -= 1
+        return _complete_degree_sequence_is_feasible(
             residual_logical, residual_ranks
-        ):
-            return True
-        for chosen in combinations(available, needed):
-            if chosen == preferred:
-                continue
-            residual_ranks = ranks.copy()
-            residual_ranks[list(chosen)] -= 1
-            if _complete_degree_sequence_is_feasible(
-                residual_logical, residual_ranks
-            ):
-                return True
-        return False
+        )
 
-    # Exact max-flow fallback for the one partially placed logical expert that
-    # remains when physical copies are processed contiguously. Keeping this
-    # generic also makes the invariant robust to future ordering changes.
-    source = 0
-    logical_offset = 1
-    rank_offset = logical_offset + active_logical.size
-    sink = rank_offset + ranks.size
-    graph: list[list[list[int]]] = [[] for _ in range(sink + 1)]
-
-    def add_edge(src: int, dst: int, capacity: int) -> None:
-        graph[src].append([dst, len(graph[dst]), capacity])
-        graph[dst].append([src, len(graph[src]) - 1, 0])
-
-    logical_nodes: dict[int, int] = {}
-    for position, logical_id in enumerate(active_logical.tolist()):
-        node = logical_offset + position
-        logical_nodes[logical_id] = node
-        add_edge(source, node, int(logical[logical_id]))
-        for rank_id in active_ranks.tolist():
-            if rank_id not in selected_ranks[logical_id]:
-                add_edge(node, rank_offset + rank_id, 1)
-    for rank_id in active_ranks.tolist():
-        add_edge(rank_offset + rank_id, sink, int(ranks[rank_id]))
-
-    flow = 0
-    while flow < required:
-        level = [-1] * len(graph)
-        level[source] = 0
-        queue = [source]
-        for node in queue:
-            for dst, _, capacity in graph[node]:
-                if capacity > 0 and level[dst] < 0:
-                    level[dst] = level[node] + 1
-                    queue.append(dst)
-        if level[sink] < 0:
-            break
-
-        cursor = [0] * len(graph)
-
-        def send_flow(node: int, pushed: int) -> int:
-            if node == sink:
-                return pushed
-            while cursor[node] < len(graph[node]):
-                edge = graph[node][cursor[node]]
-                dst, reverse, capacity = edge
-                if capacity > 0 and level[dst] == level[node] + 1:
-                    sent = send_flow(dst, min(pushed, capacity))
-                    if sent:
-                        edge[2] -= sent
-                        graph[dst][reverse][2] += sent
-                        return sent
-                cursor[node] += 1
-            return 0
-
-        while flow < required:
-            sent = send_flow(source, required - flow)
-            if sent == 0:
-                break
-            flow += sent
-    return flow == required
+    raise RuntimeError(
+        "CRAFT placement order produced multiple partially placed experts"
+    )
 
 
 def _place_layer(
@@ -389,18 +318,29 @@ def _place_layer(
     selected_ranks: list[set[int]] = [
         set() for _ in range(logical_load.size)
     ]
-    # CRAFT places physical experts from highest to lowest per-copy load.
-    # Keeping copies of one logical expert contiguous makes most feasibility
-    # checks a cheap Gale-Ryser test; only a partially placed replicated expert
-    # needs the exact residual max-flow check.
-    physical_order = sorted(
-        range(physical_to_logical.size),
-        key=lambda physical: (
-            -float(physical_copy_load[physical]),
-            int(physical_to_logical[physical]),
-            physical,
+    # Process all copies of one logical expert contiguously. This preserves the
+    # bipartite Havel-Hakimi invariant: at most one active expert has forbidden
+    # ranks, so residual feasibility needs one vectorized degree check instead
+    # of rebuilding a generic max-flow graph for every candidate.
+    physical_by_logical = tuple(
+        np.flatnonzero(physical_to_logical == logical)
+        for logical in range(logical_load.size)
+    )
+    logical_order = sorted(
+        range(logical_load.size),
+        key=lambda logical: (
+            -float(physical_copy_load[physical_by_logical[logical]].max()),
+            logical,
         ),
     )
+    physical_order = [
+        int(physical)
+        for logical in logical_order
+        for physical in sorted(
+            physical_by_logical[logical].tolist(),
+            key=lambda physical: (-float(physical_copy_load[physical]), physical),
+        )
+    ]
     for physical in physical_order:
         logical = int(physical_to_logical[physical])
         copies_by_node = np.zeros(num_nodes, dtype=np.int64)
