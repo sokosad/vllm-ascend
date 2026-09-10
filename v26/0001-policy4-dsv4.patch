@@ -1,0 +1,2443 @@
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 8860318c1..ac06d6ee0 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -838,6 +838,7 @@ class EplbConfig:
+         "num_redundant_experts": 0,
+         "eplb_policy_type": 2,
+         "eplb_heat_collection_stage": "all",
++        "eplb_node_role": "prefill",
+     }
+ 
+     def __init__(self, user_config: dict | None = None):
+@@ -858,6 +859,10 @@ class EplbConfig:
+             return self.config[key]
+         raise AttributeError(f"Config has no attribute '{key}'")
+ 
++    @property
++    def uses_global_expert_pool(self) -> bool:
++        return self.dynamic_eplb and self.eplb_policy_type == 4 and self.eplb_node_role == "prefill"
++
+     def _validate_config(self):
+         if self.expert_map_path is not None:
+             logger.info("The expert_map is %s", self.expert_map_path)
+@@ -876,8 +881,21 @@ class EplbConfig:
+                 raise TypeError(f"{key} must be an integer")
+             if self.config[key] < 0:  # type: ignore
+                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
+-        if self.eplb_policy_type not in [0, 1, 2, 3]:
+-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
++        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
++            raise ValueError("eplb_policy_type must be one of [0, 1, 2, 3, 4]")
++        if self.eplb_node_role not in ["prefill", "decode"]:
++            raise ValueError('eplb_node_role must be one of ["prefill", "decode"]')
++        if self.eplb_policy_type == 4:
++            if not self.dynamic_eplb:
++                raise ValueError("eplb_policy_type 4 requires dynamic_eplb")
++            if self.num_redundant_experts <= 0:
++                raise ValueError("eplb_policy_type 4 requires a positive num_redundant_experts")
++            if self.eplb_heat_collection_stage == "all":
++                self.config["eplb_heat_collection_stage"] = self.eplb_node_role
++            # Per-layer Policy4 can also balance a P node using prefill heat.
++            # Keep global-pool collection restricted to its prefill contract.
++            elif self.uses_global_expert_pool and self.eplb_heat_collection_stage != "prefill":
++                raise ValueError("Policy4 global expert pool requires prefill heat collection")
+         if self.config["dynamic_eplb"]:
+             assert (
+                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")
+diff --git a/vllm_ascend/eplb/adaptor/vllm_adaptor.py b/vllm_ascend/eplb/adaptor/vllm_adaptor.py
+index 0ac6c6f0f..97d770947 100644
+--- a/vllm_ascend/eplb/adaptor/vllm_adaptor.py
++++ b/vllm_ascend/eplb/adaptor/vllm_adaptor.py
+@@ -65,6 +65,16 @@ EPLB_EXPERT_WEIGHT_NAMES = {
+     (QuantType.W8A8MXFP, True): ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+ }
+ 
++_GLOBAL_POOL_EXPERT_WEIGHT_KEYS = frozenset(
++    {
++        (QuantType.NONE, False),
++        (QuantType.W8A8, False),
++        (QuantType.W8A8, True),
++    }
++)
++
++_GLOBAL_POOL_FUSED_MAX_EP_SIZE = 32
++
+ 
+ class VllmEplbAdaptor:
+     _registered_moe_layers: list["torch.nn.Module"] = []
+@@ -90,21 +100,31 @@ class VllmEplbAdaptor:
+         self.world_size = dist.get_world_size()
+         self.num_dense_layers = getattr(self.config, "first_k_dense_replace", 0)
+ 
+-        self.moe_layers = VllmEplbAdaptor._registered_moe_layers
++        model_module_ids = {id(module) for module in model.modules()}
++        self.moe_layers = [layer for layer in VllmEplbAdaptor._registered_moe_layers if id(layer) in model_module_ids]
+         self.num_moe_layers = len(self.moe_layers)
+ 
+         self.expert_map_per_layer_cpu = dict()  # copy of expert map on CPU to avoid device synchronize frequently
+ 
+         # Get num_local_experts from first real MoE layer
+         first_layer = self.moe_layers[0]
++        eplb_config = get_ascend_config().eplb_config
++        self.global_slots_per_rank = eplb_config.num_redundant_experts if eplb_config.uses_global_expert_pool else 0
+         self.num_local_experts = first_layer.local_num_experts
++        self.base_num_local_experts = self.num_local_experts
+         self.ep_rank = first_layer.ep_rank
++        self.ep_size = first_layer.moe_config.ep_size
+ 
+         self.expert_param_per_layer = dict()
+         self.expert_weight_key_per_layer = dict()
+         self.init_expert_param_per_layer()
++        if self.global_slots_per_rank:
++            self._init_global_slot_pool(self.global_slots_per_rank)
++            self.num_local_experts += self.global_slots_per_rank
++            self.init_expert_param_per_layer()
++            self._resize_initial_log2phy_maps()
+ 
+-        num_buffer_tensor = self.num_local_experts
++        num_buffer_tensor = 0 if self.global_slots_per_rank else self.num_local_experts
+         self.buffer_tensor_list: dict[Any, list[list[Any]]] = dict()
+         self.init_buffer_tensor(num_buffer_tensor)
+ 
+@@ -112,6 +132,121 @@ class VllmEplbAdaptor:
+         for local_idx, layer in enumerate(self.moe_layers):
+             self.log2phy_map_per_layer[local_idx] = layer.get_log2phy_map()
+ 
++    def _init_global_slot_pool(self, slots_per_rank: int) -> None:
++        """Allocate one per-rank expert pool shared by every local MoE layer."""
++        first_layer = self.moe_layers[0]
++        first_weight_key = self.expert_weight_key_per_layer[0]
++        if first_weight_key not in _GLOBAL_POOL_EXPERT_WEIGHT_KEYS:
++            raise NotImplementedError("EPLB policy 4 supports unquantized non-fused weights or W8A8 weights")
++        if first_weight_key[1] and self.ep_size > _GLOBAL_POOL_FUSED_MAX_EP_SIZE:
++            raise ValueError("EPLB global pool with fused MC2 requires EP <= 32")
++        if getattr(first_layer.moe_config, "has_bias", False):
++            raise NotImplementedError("EPLB policy 4 does not support biased expert weights")
++        weight_names = EPLB_EXPERT_WEIGHT_NAMES[first_weight_key]
++        self._validate_global_pool_weights(first_weight_key, weight_names)
++        pool: dict[str, list[torch.Tensor]] = {}
++        for name in weight_names:
++            source = self.param_dict[f"0.{name}"]
++            if len(source) != self.base_num_local_experts:
++                raise ValueError(
++                    f"Unexpected base expert count for {name}: "
++                    f"expected {self.base_num_local_experts}, got {len(source)}"
++                )
++            pool[name] = []
++            for slot_id in range(slots_per_rank):
++                buffer_name = f"_eplb_global_{name}_{slot_id}"
++                first_layer.register_buffer(
++                    buffer_name,
++                    torch.empty_like(source[0]),
++                    persistent=False,
++                )
++                pool[name].append(getattr(first_layer, buffer_name))
++
++        global_redundancy = slots_per_rank * self.ep_size
++        for local_idx, layer in enumerate(self.moe_layers):
++            if self.expert_weight_key_per_layer[local_idx] != first_weight_key:
++                raise ValueError("EPLB policy 4 requires identical expert weight formats across MoE layers")
++            for name in weight_names:
++                values = self.param_dict[f"{local_idx}.{name}"]
++                expected_shape = pool[name][0].shape
++                if values[0].shape != expected_shape:
++                    raise ValueError(f"EPLB policy 4 requires identical {name} shapes across MoE layers")
++                if isinstance(values, list):
++                    values.extend(pool[name])
++                elif torch.is_tensor(values):
++                    weight_owner = getattr(layer, "routed_experts", layer)
++                    setattr(
++                        weight_owner,
++                        f"{name}_list",
++                        [values[expert_id] for expert_id in range(self.base_num_local_experts)] + pool[name],
++                    )
++                else:
++                    raise TypeError(
++                        f"Unsupported EPLB policy 4 expert weight container for {name}: {type(values).__name__}"
++                    )
++
++            layer.moe_config.num_local_experts += slots_per_rank
++            layer.moe_config.num_experts += global_redundancy
++            layer.moe_config.global_redundant_expert_num += global_redundancy
++            layer.global_redundant_expert_num += global_redundancy
++            layer.moe_load = torch.cat(
++                (
++                    layer.moe_load,
++                    torch.zeros(
++                        slots_per_rank,
++                        dtype=layer.moe_load.dtype,
++                        device=layer.moe_load.device,
++                    ),
++                )
++            )
++
++        from vllm.config import set_current_vllm_config
++
++        from vllm_ascend.ops.fused_moe.moe_comm_method import resize_moe_comm_expert_layout
++
++        # EPLB warmup runs outside model initialization. Re-enter the target
++        # layer's context, not the draft context, for dispatcher construction.
++        with set_current_vllm_config(first_layer._eplb_vllm_config):
++            resize_moe_comm_expert_layout(
++                first_layer.moe_config.num_experts,
++                self.base_num_local_experts + slots_per_rank,
++                moe_config=first_layer.moe_config,
++            )
++        self.global_slot_pool = pool
++
++    def _validate_global_pool_weights(self, weight_key, weight_names) -> None:
++        """Check every layer before extending shared weight and scale lists."""
++        for local_idx, layer in enumerate(self.moe_layers):
++            if self.expert_weight_key_per_layer[local_idx] != weight_key:
++                raise ValueError("EPLB policy 4 requires identical expert weight formats across MoE layers")
++            if getattr(layer.moe_config, "has_bias", False):
++                raise NotImplementedError("EPLB policy 4 does not support biased expert weights")
++            for name in weight_names:
++                values = self.param_dict[f"{local_idx}.{name}"]
++                reference = self.param_dict[f"0.{name}"][0]
++                if len(values) != self.base_num_local_experts:
++                    raise ValueError(f"EPLB global pool requires {self.base_num_local_experts} base entries for {name}")
++                if any(
++                    value.shape != reference.shape or value.dtype != reference.dtype or value.device != reference.device
++                    for value in values
++                ):
++                    raise ValueError(f"EPLB global pool requires identical {name} shapes, dtypes and devices")
++
++    def _resize_initial_log2phy_maps(self) -> None:
++        """Account for the shared slots in each rank's physical stride."""
++        expanded_slots = self.base_num_local_experts + self.global_slots_per_rank
++        for layer in self.moe_layers:
++            log2phy_map = layer.get_log2phy_map()
++            if log2phy_map is None:
++                continue
++            rank_ids = torch.div(
++                log2phy_map,
++                self.base_num_local_experts,
++                rounding_mode="floor",
++            )
++            local_ids = torch.remainder(log2phy_map, self.base_num_local_experts)
++            log2phy_map.copy_(rank_ids * expanded_slots + local_ids)
++
+     def init_buffer_tensor(self, num_buffer_tensor):
+         buffer_tensor_shapes: dict[Any, list[torch.Size]] = dict()
+         for local_idx, _ in enumerate(self.moe_layers):
+diff --git a/vllm_ascend/eplb/core/eplb_device_transfer_loader.py b/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+index baf72f0a4..dd7f2fada 100644
+--- a/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
++++ b/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+@@ -16,6 +16,7 @@
+ #
+ from enum import Enum
+ 
++import torch
+ import torch.distributed as dist
+ from vllm.logger import logger
+ from vllm.v1.utils import record_function_or_nullcontext
+@@ -43,6 +44,64 @@ class D2DExpertWeightLoader:
+     def set_adator(self, eplb_adaptor):
+         self.eplb_adaptor = eplb_adaptor
+ 
++    def initialize_redundant_expert_weights(self):
++        """Populate per-layer redundant slots before they become routable.
++
++        Fused expert checkpoints load the original experts as one 3D tensor,
++        so upstream's per-expert mapping cannot duplicate the trailing physical
++        slots. Initialize those slots from the original physical experts with
++        the same P2P path used by runtime migrations.
++        """
++        adaptor = self.eplb_adaptor
++        if not adaptor.moe_layers:
++            return
++
++        moe_config = adaptor.moe_layers[0].moe_config
++        num_logical_experts = int(moe_config.num_logical_experts)
++        num_physical_experts = int(moe_config.num_experts)
++        num_redundant_experts = num_physical_experts - num_logical_experts
++        if num_redundant_experts <= 0:
++            return
++
++        local_capacity = adaptor.num_local_experts
++        if num_physical_experts != local_capacity * adaptor.ep_size:
++            raise ValueError(
++                "Initial redundant expert layout must be evenly distributed: "
++                f"physical={num_physical_experts}, local={local_capacity}, ep={adaptor.ep_size}."
++            )
++
++        rank = adaptor.ep_rank
++        for layer_id in range(adaptor.num_moe_layers):
++            for redundant_id in range(num_redundant_experts):
++                step = {"send": [], "recv": []}
++                logical_id = redundant_id % num_logical_experts
++                src_rank, source_slot = divmod(logical_id, local_capacity)
++                dst_rank, target_slot = divmod(num_logical_experts + redundant_id, local_capacity)
++                if src_rank == dst_rank:
++                    if rank == src_rank:
++                        for source_tensor, target_tensor in zip(
++                            adaptor.expert_param_per_layer[layer_id][source_slot],
++                            adaptor.expert_param_per_layer[layer_id][target_slot],
++                        ):
++                            target_tensor.copy_(source_tensor)
++                elif rank == src_rank:
++                    step["send"].append((dst_rank, layer_id, source_slot))
++                elif rank == dst_rank:
++                    step["recv"].append((src_rank, layer_id, target_slot))
++
++                # Bound startup-only P2P work to one expert. Submitting every
++                # layer at once retains thousands of outstanding transfers
++                # while the runtime is measuring its non-KV memory budget.
++                requests = self.start_global_slot_transfer(step)
++                for request in requests:
++                    request.wait()
++        if rank == 0:
++            logger.info(
++                "[eplb/d2d_loader] Initialized %s redundant experts across %s layers",
++                num_redundant_experts,
++                adaptor.num_moe_layers,
++            )
++
+     def generate_expert_d2d_transfer_task(self, expert_send_info, expert_recv_info, updated_expert_map, layer_id):
+         # When current send/recv and weight.expert_map update tasks are not finished, cannot accept new d2d task
+         if self.state != ExpertWeightUpdateState.WAITING:
+@@ -136,3 +195,43 @@ class D2DExpertWeightLoader:
+         self.updated_expert_map = None
+         self.layer_id = -1
+         self.state = ExpertWeightUpdateState.WAITING
++
++    def apply_global_map_updates(self, updates):
++        """Apply the map half of one staged policy-4 transaction."""
++        for update in updates:
++            layer_id = update["layer_id"]
++            self.eplb_adaptor.do_update_expert_map(layer_id, torch.tensor(update["rank_map"], dtype=torch.int32))
++            self.eplb_adaptor.do_update_log2phy_map(layer_id, torch.tensor(update["log2phy_map"], dtype=torch.int32))
++
++    def start_global_slot_transfer(self, step):
++        """Start D2D into slots deactivated before this model iteration."""
++        comm_ops = []
++        for dst_rank, relative_layer, source_slot in step["send"]:
++            layer_id = relative_layer
++            for source_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][source_slot]:
++                comm_ops.append(
++                    dist.P2POp(
++                        dist.isend,
++                        source_tensor,
++                        self.comm_group.ranks[dst_rank],
++                        group=self.comm_group.device_group,
++                    )
++                )
++        for src_rank, relative_layer, target_slot in step["recv"]:
++            layer_id = relative_layer
++            for target_tensor in self.eplb_adaptor.expert_param_per_layer[layer_id][target_slot]:
++                comm_ops.append(
++                    dist.P2POp(
++                        dist.irecv,
++                        target_tensor,
++                        self.comm_group.ranks[src_rank],
++                        group=self.comm_group.device_group,
++                    )
++                )
++        return dist.batch_isend_irecv(comm_ops) if comm_ops else []
++
++    def finish_global_slot_transfer(self, requests, step):
++        """Wait for staged weights, then expose them to token routing."""
++        for request in requests:
++            request.wait()
++        self.apply_global_map_updates(step["activate"])
+diff --git a/vllm_ascend/eplb/core/eplb_global_worker.py b/vllm_ascend/eplb/core/eplb_global_worker.py
+new file mode 100644
+index 000000000..3736a237c
+--- /dev/null
++++ b/vllm_ascend/eplb/core/eplb_global_worker.py
+@@ -0,0 +1,214 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Atomic update-plan construction for policy-4 shared expert slots."""
++
++from __future__ import annotations
++
++import numpy as np
++import torch
++from vllm.logger import logger
++
++_GLOBAL_SLOT_BATCH_PER_RANK = 4
++
++
++def _global_maps_to_table(global_maps: np.ndarray, local_slots: int) -> np.ndarray:
++    num_layers, num_ranks, num_experts = global_maps.shape
++    table = np.full((num_layers, num_ranks, local_slots), -1, dtype=np.int64)
++    for layer_id in range(num_layers):
++        for rank_id in range(num_ranks):
++            for expert_id in range(num_experts):
++                local_slot = int(global_maps[layer_id, rank_id, expert_id])
++                if local_slot < 0:
++                    continue
++                if local_slot >= local_slots or table[layer_id, rank_id, local_slot] >= 0:
++                    raise ValueError("invalid global expert map for policy 4")
++                table[layer_id, rank_id, local_slot] = expert_id
++    return table
++
++
++def _table_to_global_maps(table: np.ndarray, num_experts: int) -> np.ndarray:
++    maps = np.full((table.shape[0], table.shape[1], num_experts), -1, dtype=np.int32)
++    for layer_id in range(table.shape[0]):
++        for rank_id in range(table.shape[1]):
++            for local_slot, expert_id in enumerate(table[layer_id, rank_id]):
++                if expert_id < 0:
++                    continue
++                if maps[layer_id, rank_id, expert_id] >= 0:
++                    raise ValueError("a rank cannot hold two copies of one logical expert")
++                maps[layer_id, rank_id, expert_id] = local_slot
++    return maps
++
++
++def _log2phy_map(global_map: np.ndarray, ep_rank: int, local_slots: int) -> list[int]:
++    result = np.empty(global_map.shape[1], dtype=np.int32)
++    for expert_id in range(global_map.shape[1]):
++        holders = [
++            int(global_map[rank_id, expert_id]) + rank_id * local_slots
++            for rank_id in range(global_map.shape[0])
++            if global_map[rank_id, expert_id] >= 0
++        ]
++        if not holders:
++            raise ValueError(f"logical expert {expert_id} has no physical copy")
++        result[expert_id] = holders[ep_rank % len(holders)]
++    return result.tolist()
++
++
++def _layer_updates(
++    global_maps: np.ndarray,
++    layer_ids: set[int],
++    rank_id: int,
++    local_slots: int,
++) -> list[dict]:
++    return [
++        {
++            "layer_id": layer_id,
++            "rank_map": global_maps[layer_id, rank_id].tolist(),
++            "log2phy_map": _log2phy_map(global_maps[layer_id], rank_id, local_slots),
++        }
++        for layer_id in sorted(layer_ids)
++    ]
++
++
++def do_global_slot_update(worker):
++    global_maps_value = worker.shared_dict.get("expert_maps", None)
++    workload_value = worker.shared_dict.get("moe_load", None)
++    if global_maps_value is None or workload_value is None:
++        return {"kind": "global_slots", "changed": False}
++    global_maps = np.asarray(
++        global_maps_value.numpy() if isinstance(global_maps_value, torch.Tensor) else global_maps_value,
++        dtype=np.int32,
++    )
++    workload = np.asarray(
++        workload_value.numpy() if isinstance(workload_value, torch.Tensor) else workload_value,
++        dtype=np.float64,
++    )
++    local_slots = workload.shape[-1]
++    old_table = _global_maps_to_table(global_maps, local_slots)
++    changed, _, placement = worker.policy.rebalance_experts(old_table, workload)
++    decision = getattr(worker.policy, "last_decision", None)
++    if not changed:
++        if worker.rank_id == 0 and decision is not None:
++            logger.debug(
++                "[eplb/global] Skip plan reason=%s gain=%.6f changed_slots=%s",
++                decision.reason,
++                decision.gain,
++                decision.changed_slots,
++            )
++        return {"kind": "global_slots", "changed": False}
++
++    new_table = np.asarray(placement, dtype=np.int64)
++    num_layers, num_ranks, _ = new_table.shape
++    num_experts = global_maps.shape[-1]
++    base_slots = num_experts // num_ranks
++    new_maps = _table_to_global_maps(new_table, num_experts)
++    transitions_by_slot: list[list[dict]] = [[] for _ in range(local_slots - base_slots)]
++    for dst_rank in range(num_ranks):
++        for shared_slot in range(local_slots - base_slots):
++            local_slot = base_slots + shared_slot
++            old_owners = [
++                (layer_id, int(old_table[layer_id, dst_rank, local_slot]))
++                for layer_id in range(num_layers)
++                if old_table[layer_id, dst_rank, local_slot] >= 0
++            ]
++            new_owners = [
++                (layer_id, int(new_table[layer_id, dst_rank, local_slot]))
++                for layer_id in range(num_layers)
++                if new_table[layer_id, dst_rank, local_slot] >= 0
++            ]
++            if len(old_owners) > 1 or len(new_owners) > 1:
++                raise ValueError("a global physical slot cannot be owned by multiple layers")
++            old_owner = old_owners[0] if old_owners else None
++            new_owner = new_owners[0] if new_owners else None
++            if new_owner == old_owner:
++                continue
++            transitions_by_slot[shared_slot].append(
++                {
++                    "dst_rank": dst_rank,
++                    "local_slot": local_slot,
++                    "old_owner": old_owner,
++                    "new_owner": new_owner,
++                }
++            )
++
++    working_maps = global_maps.copy()
++    steps: list[dict] = []
++    for first_slot in range(0, len(transitions_by_slot), _GLOBAL_SLOT_BATCH_PER_RANK):
++        transitions = [
++            transition
++            for slot_transitions in transitions_by_slot[first_slot : first_slot + _GLOBAL_SLOT_BATCH_PER_RANK]
++            for transition in slot_transitions
++        ]
++        if not transitions:
++            continue
++
++        deactivate_layers: set[int] = set()
++        for transition in transitions:
++            old_owner = transition["old_owner"]
++            if old_owner is None:
++                continue
++            layer_id, expert_id = old_owner
++            dst_rank = transition["dst_rank"]
++            local_slot = transition["local_slot"]
++            if working_maps[layer_id, dst_rank, expert_id] != local_slot:
++                raise ValueError("policy 4 old slot owner does not match the active map")
++            working_maps[layer_id, dst_rank, expert_id] = -1
++            deactivate_layers.add(layer_id)
++        deactivated_maps = working_maps.copy()
++
++        send: list[list[int]] = []
++        recv: list[list[int]] = []
++        activate_layers: set[int] = set()
++        for transition in transitions:
++            new_owner = transition["new_owner"]
++            if new_owner is None:
++                continue
++            layer_id, expert_id = new_owner
++            dst_rank = transition["dst_rank"]
++            local_slot = transition["local_slot"]
++            source_locations = np.argwhere(new_table[layer_id, :, :base_slots] == expert_id)
++            if source_locations.shape[0] != 1:
++                raise ValueError("policy 4 requires one immutable base source for every expert")
++            src_rank, source_slot = (int(value) for value in source_locations[0])
++            if worker.rank_id == src_rank:
++                send.append([dst_rank, layer_id, source_slot])
++            if worker.rank_id == dst_rank:
++                recv.append([src_rank, layer_id, local_slot])
++            working_maps[layer_id, dst_rank, expert_id] = local_slot
++            activate_layers.add(layer_id)
++
++        steps.append(
++            {
++                "deactivate": _layer_updates(
++                    deactivated_maps,
++                    deactivate_layers,
++                    worker.rank_id,
++                    local_slots,
++                ),
++                "send": send,
++                "recv": recv,
++                "activate": _layer_updates(working_maps, activate_layers, worker.rank_id, local_slots),
++                "changed_slots": len(transitions),
++            }
++        )
++
++    if not np.array_equal(working_maps, new_maps):
++        raise ValueError("policy 4 staged update does not reach the planned map")
++
++    changed_layers = int(np.count_nonzero(np.any(new_table != old_table, axis=(1, 2))))
++    if worker.rank_id == 0:
++        logger.info(
++            "[eplb/global] Apply plan gain=%.6f changed_slots=%s changed_layers=%s steps=%s active_slots=%s",
++            decision.gain if decision is not None else 0.0,
++            decision.changed_slots if decision is not None else sum(step["changed_slots"] for step in steps),
++            changed_layers,
++            len(steps),
++            int(np.count_nonzero(new_table[:, :, base_slots:] >= 0)),
++        )
++    return {
++        "kind": "global_slots",
++        "changed": True,
++        "steps": steps,
++        "global_maps": new_maps.tolist(),
++    }
++
++
++__all__ = ["do_global_slot_update"]
+diff --git a/vllm_ascend/eplb/core/eplb_worker.py b/vllm_ascend/eplb/core/eplb_worker.py
+index 76a0fcf13..684c530b5 100644
+--- a/vllm_ascend/eplb/core/eplb_worker.py
++++ b/vllm_ascend/eplb/core/eplb_worker.py
+@@ -33,17 +33,26 @@ class EplbWorker:
+         policy_type,
+         enable_d2d: bool = True,
+         tp_size: int | None = None,
++        policy_config: dict | None = None,
+     ):
+         self.policy_type = policy_type
+-        self.policy = PolicyFactory.generate_policy(policy_type)
++        self.policy = PolicyFactory.generate_policy(policy_type, policy_config)
+         self.shared_dict = shared_dict
+         self.old_expert_maps = None
+         self.enable_d2d = enable_d2d
+         self.tp_size = tp_size
+         self.rank_id = get_ep_group().rank_in_group
+         self.multi_stage = policy_type == 3
++        self.uses_global_expert_pool = (
++            policy_type == 4 and (policy_config or {}).get("node_role", "prefill") == "prefill"
++        )
+ 
+     def do_update(self):
++        if self.uses_global_expert_pool:
++            torch.set_num_threads(1)
++            from vllm_ascend.eplb.core.eplb_global_worker import do_global_slot_update
++
++            return do_global_slot_update(self)
+         # put data in to queue
+         # in process self.policy.generate_policy()
+         # get epxert table && tensor
+@@ -68,7 +77,7 @@ class EplbWorker:
+ 
+         # Get the updated expert table based on the workload information
+         old_placement = self.global2local(self.old_expert_maps, self.num_local_experts)
+-        _, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
++        changed, _, new_placement = self.calculate_rebalance_experts(load_info, old_placement)
+ 
+         if self.rank_id == 0:
+             if self.multi_stage:
+@@ -99,10 +108,17 @@ class EplbWorker:
+                 update_max,
+             )
+ 
++        if self.policy_type == 4 and not changed:
++            logger.debug("[eplb/worker] Policy 4 placement unchanged, skipping weight update")
++            return []
++
+         if not torch.is_tensor(new_placement):
+             new_placement = torch.tensor(new_placement)
+         self.check_expert_placement(old_placement, new_placement)
+         new_expert_maps = self.local2global(new_placement)
++        if self.policy_type == 4 and torch.equal(new_expert_maps, self.old_expert_maps):
++            logger.debug("[eplb/worker] Policy 4 validated placement unchanged, skipping weight update")
++            return []
+         self.update_expert_map(new_expert_maps)
+ 
+         update_info = self.compose_expert_update_info_greedy(new_expert_maps, self.old_expert_maps)
+@@ -341,12 +357,14 @@ class EplbProcess:
+         policy_type: int = 0,
+         enable_d2d: bool = True,
+         tp_size: int | None = None,
++        policy_config: dict | None = None,
+     ):
+         """
+         Args:
+             shared_dict: Cross-process shared dict returned by Manager().dict()
+             policy_type: Integer passed to PolicyFactory.generate_policy
+             enable_d2d: Whether to enable D2D loading
++            policy_config: Optional constructor arguments for the selected policy
+         """
+         self.shared_dict = shared_dict
+         self.policy_type = policy_type
+@@ -360,6 +378,7 @@ class EplbProcess:
+             self.policy_type,
+             self.enable_d2d,
+             tp_size=tp_size,
++            policy_config=policy_config,
+         )
+ 
+     def worker_process(self, planner_q, block_update_q):
+@@ -386,11 +405,7 @@ class EplbProcess:
+ 
+                 packed_update_info = self.worker.do_update()
+ 
+-                while True:
+-                    if not block_update_q.empty():
+-                        continue
+-                    block_update_q.put(packed_update_info)
+-                    break
++                block_update_q.put(packed_update_info)
+ 
+             except Exception as e:
+                 logger.warning(
+diff --git a/vllm_ascend/eplb/core/policy/layer_placement.py b/vllm_ascend/eplb/core/policy/layer_placement.py
+new file mode 100644
+index 000000000..aa733a4c6
+--- /dev/null
++++ b/vllm_ascend/eplb/core/policy/layer_placement.py
+@@ -0,0 +1,558 @@
++# SPDX-License-Identifier: Apache-2.0
++#
++# Capacity-aware per-layer expert placement utilities.
++#
++# This module intentionally has no dependency on torch or the EPLB runtime.  It
++# can therefore be used by an offline map builder and by a background dynamic
++# policy worker without importing device libraries.
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import numpy as np
++
++
++Placement = tuple[tuple[np.ndarray, ...], ...]
++
++
++def _strict_integer(value: object, name: str, *, minimum: int | None = None) -> int:
++    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
++        raise TypeError(f"{name} must be an integer")
++    result = int(value)
++    if minimum is not None and result < minimum:
++        raise ValueError(f"{name} must be at least {minimum}, got {result}")
++    return result
++
++
++def _strict_integer_array(value: object, name: str, *, ndim: int | None = None) -> np.ndarray:
++    result = np.asarray(value)
++    if result.dtype == np.bool_ or not np.issubdtype(result.dtype, np.integer):
++        raise TypeError(f"{name} must contain only integers")
++    if ndim is not None and result.ndim != ndim:
++        raise ValueError(f"{name} must be {ndim}-dimensional")
++    return result.astype(np.int64, copy=False)
++
++
++def _normalise_load(expert_load: np.ndarray | Sequence[object]) -> np.ndarray:
++    raw_load = np.asarray(expert_load)
++    if raw_load.dtype == np.bool_:
++        raise TypeError("expert_load must be numeric, not boolean")
++    load = np.asarray(expert_load, dtype=np.float64)
++    if load.ndim == 2:
++        load = load[np.newaxis, ...]
++    if load.ndim != 3:
++        raise ValueError(
++            "expert_load must have shape [layers, experts] or "
++            f"[batches, layers, experts], got {load.shape}"
++        )
++    if 0 in load.shape:
++        raise ValueError(f"expert_load dimensions must be non-zero, got {load.shape}")
++    if not np.all(np.isfinite(load)):
++        raise ValueError("expert_load must contain only finite values")
++    if np.any(load < 0):
++        raise ValueError("expert_load must be non-negative")
++    return load
++
++
++def capacity_aware_interleaving(
++    physical_experts_by_layer: Sequence[int] | np.ndarray,
++    num_ranks: int,
++) -> np.ndarray:
++    """Distribute variable layer capacities while balancing total rank memory.
++
++    This is Algorithm 3 from layer-aware, applied to total physical experts.  Applying
++    it to total experts is equivalent to applying it to replicas when the
++    logical expert count is divisible by the EP rank count, and also handles
++    the non-divisible case.
++    """
++
++    totals = _strict_integer_array(
++        physical_experts_by_layer,
++        "physical_experts_by_layer",
++        ndim=1,
++    )
++    if totals.ndim != 1 or totals.size == 0:
++        raise ValueError("physical_experts_by_layer must be a non-empty vector")
++    if np.any(totals < 0):
++        raise ValueError("physical expert counts must be non-negative")
++    num_ranks = _strict_integer(num_ranks, "num_ranks", minimum=1)
++
++    base = totals // num_ranks
++    remainder = totals % num_ranks
++    capacity = np.repeat(base[:, np.newaxis], num_ranks, axis=1)
++    rank_totals = capacity.sum(axis=0)
++
++    for layer, count in enumerate(remainder.tolist()):
++        if count == 0:
++            continue
++        ordered = np.argsort(rank_totals, kind="stable")
++        cutoff = rank_totals[ordered[count - 1]]
++        must_choose = np.flatnonzero(rank_totals < cutoff)
++        tied = np.flatnonzero(rank_totals == cutoff)
++        tie_count = count - must_choose.size
++        if tie_count:
++            positions = np.linspace(0, tied.size - 1, tie_count).astype(np.int64)
++            selected = np.concatenate((must_choose, tied[positions]))
++        else:
++            selected = must_choose
++        capacity[layer, selected] += 1
++        rank_totals[selected] += 1
++
++    return capacity
++
++
++def _replicate_layer(
++    logical_load: np.ndarray,
++    num_replicas: int,
++    num_ranks: int,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Select replicas by repeatedly splitting the hottest effective expert."""
++
++    num_replicas = _strict_integer(num_replicas, "num_replicas", minimum=0)
++    num_ranks = _strict_integer(num_ranks, "num_ranks", minimum=1)
++    num_experts = logical_load.size
++    max_replicas = num_experts * (num_ranks - 1)
++    if num_replicas < 0 or num_replicas > max_replicas:
++        raise ValueError(
++            "infeasible replica budget: each logical expert may have at most "
++            f"{num_ranks} total copies, so at most {max_replicas} additional "
++            f"replicas are possible; got {num_replicas}"
++        )
++
++    copy_count = np.ones(num_experts, dtype=np.int64)
++    replicas: list[int] = []
++    for _ in range(num_replicas):
++        eligible = np.flatnonzero(copy_count < num_ranks)
++        if eligible.size == 0:
++            raise ValueError(
++                "infeasible replica budget: all logical experts already have "
++                f"the maximum {num_ranks} total copies"
++            )
++        source_multiplicity = np.ceil(num_ranks / copy_count[eligible])
++        effective_load = logical_load[eligible] * source_multiplicity / num_ranks
++        expert = int(eligible[int(np.argmax(effective_load))])
++        replicas.append(expert)
++        copy_count[expert] += 1
++        if copy_count[expert] > num_ranks:
++            raise RuntimeError(
++                "layer-aware replica planner violated the per-expert copy limit"
++            )
++
++    physical_to_logical = np.concatenate(
++        (
++            np.arange(num_experts, dtype=np.int64),
++            np.asarray(replicas, dtype=np.int64),
++        )
++    )
++    return physical_to_logical, copy_count
++
++
++def _source_ranks_per_copy(copy_count: int, num_ranks: int) -> np.ndarray:
++    """Return runtime owners for ``source_rank % copy_count`` routing."""
++
++    copy_count = _strict_integer(copy_count, "copy_count", minimum=1)
++    num_ranks = _strict_integer(num_ranks, "num_ranks", minimum=1)
++    if copy_count > num_ranks:
++        raise ValueError("copy_count cannot exceed num_ranks")
++    return np.bincount(
++        np.arange(num_ranks, dtype=np.int64) % copy_count,
++        minlength=copy_count,
++    )
++
++
++def _physical_copy_loads(
++    physical_to_logical: np.ndarray,
++    logical_load: np.ndarray,
++    copy_count: np.ndarray,
++    num_ranks: int,
++) -> np.ndarray:
++    occurrence = np.zeros(logical_load.size, dtype=np.int64)
++    result = np.empty(physical_to_logical.size, dtype=np.float64)
++    weights = [
++        _source_ranks_per_copy(int(count), num_ranks) / num_ranks
++        for count in copy_count.tolist()
++    ]
++    for physical, logical_value in enumerate(physical_to_logical.tolist()):
++        logical = int(logical_value)
++        copy_index = int(occurrence[logical])
++        result[physical] = logical_load[logical] * weights[logical][copy_index]
++        occurrence[logical] += 1
++    return result
++
++
++def _complete_degree_sequence_is_feasible(
++    logical_remaining: np.ndarray,
++    rank_remaining: np.ndarray,
++) -> bool:
++    """Check an unrestricted bipartite degree sequence with Gale-Ryser."""
++
++    logical = np.asarray(logical_remaining, dtype=np.int64)
++    ranks = np.asarray(rank_remaining, dtype=np.int64)
++    if np.any(logical < 0) or np.any(ranks < 0):
++        return False
++    if int(logical.sum()) != int(ranks.sum()):
++        return False
++
++    logical = np.sort(logical[logical > 0])[::-1]
++    ranks = np.sort(ranks[ranks > 0])[::-1]
++    if logical.size == 0:
++        return ranks.size == 0
++    if ranks.size == 0:
++        return False
++    if int(logical[0]) > ranks.size or int(ranks[0]) > logical.size:
++        return False
++
++    counts = np.arange(1, logical.size + 1, dtype=np.int64)
++    logical_prefix = np.cumsum(logical)
++    rank_prefix_bound = np.minimum(
++        ranks[:, None], counts[None, :]
++    ).sum(axis=0)
++    return bool(np.all(logical_prefix <= rank_prefix_bound))
++
++
++def _residual_placement_is_feasible(
++    logical_remaining: np.ndarray,
++    rank_remaining: np.ndarray,
++    selected_ranks: Sequence[set[int]],
++) -> bool:
++    """Check whether the residual duplicate-free placement has a completion."""
++
++    logical = np.asarray(logical_remaining, dtype=np.int64)
++    ranks = np.asarray(rank_remaining, dtype=np.int64)
++    if logical.ndim != 1 or ranks.ndim != 1:
++        return False
++    if len(selected_ranks) != logical.size:
++        return False
++    if np.any(logical < 0) or np.any(ranks < 0):
++        return False
++    required = int(logical.sum())
++    if required != int(ranks.sum()):
++        return False
++    if required == 0:
++        return True
++
++    active_logical = np.flatnonzero(logical > 0)
++    active_ranks = np.flatnonzero(ranks > 0)
++    for logical_id in active_logical.tolist():
++        available = sum(
++            rank_id not in selected_ranks[logical_id]
++            for rank_id in active_ranks.tolist()
++        )
++        if int(logical[logical_id]) > available:
++            return False
++
++    has_active_forbidden_edges = any(
++        selected_ranks[logical_id]
++        for logical_id in active_logical.tolist()
++    )
++    if not has_active_forbidden_edges:
++        return _complete_degree_sequence_is_feasible(logical, ranks)
++
++    partial = [
++        logical_id
++        for logical_id in active_logical.tolist()
++        if selected_ranks[logical_id]
++    ]
++    if len(partial) == 1:
++        logical_id = partial[0]
++        available = [
++            rank_id
++            for rank_id in active_ranks.tolist()
++            if rank_id not in selected_ranks[logical_id]
++        ]
++        needed = int(logical[logical_id])
++        residual_logical = logical.copy()
++        residual_logical[logical_id] = 0
++        preferred = sorted(
++            available,
++            key=lambda rank_id: (-int(ranks[rank_id]), rank_id),
++        )[:needed]
++        residual_ranks = ranks.copy()
++        residual_ranks[preferred] -= 1
++        return _complete_degree_sequence_is_feasible(
++            residual_logical, residual_ranks
++        )
++
++    raise RuntimeError(
++        "layer-aware placement order produced multiple partially placed experts"
++    )
++
++
++def _place_layer(
++    physical_to_logical: np.ndarray,
++    logical_load: np.ndarray,
++    copy_count: np.ndarray,
++    rank_capacity: np.ndarray,
++    num_nodes: int,
++) -> tuple[tuple[np.ndarray, ...], np.ndarray]:
++    """Artifact-style capacity-aware, node-interleaved greedy placement."""
++
++    num_ranks = rank_capacity.size
++    if num_nodes <= 0 or num_ranks % num_nodes != 0:
++        raise ValueError(
++            f"num_nodes={num_nodes} must divide num_ranks={num_ranks}"
++        )
++    if int(rank_capacity.sum()) != physical_to_logical.size:
++        raise ValueError(
++            "rank capacity does not match physical expert count: "
++            f"{rank_capacity.sum()} != {physical_to_logical.size}"
++        )
++
++    ranks_per_node = num_ranks // num_nodes
++    physical_copy_load = _physical_copy_loads(
++        physical_to_logical,
++        logical_load,
++        copy_count,
++        num_ranks,
++    )
++    rank_load = np.zeros(num_ranks, dtype=np.float64)
++    rank_count = np.zeros(num_ranks, dtype=np.int64)
++    rank_remaining = rank_capacity.astype(np.int64, copy=True)
++    rank_lists: list[list[int]] = [[] for _ in range(num_ranks)]
++    physical_to_rank = np.full(physical_to_logical.size, -1, dtype=np.int64)
++
++    remaining_copies = copy_count.astype(np.int64, copy=True)
++    selected_ranks: list[set[int]] = [
++        set() for _ in range(logical_load.size)
++    ]
++    # Process all copies of one logical expert contiguously. This preserves the
++    # bipartite Havel-Hakimi invariant: at most one active expert has forbidden
++    # ranks, so residual feasibility needs one vectorized degree check instead
++    # of rebuilding a generic max-flow graph for every candidate.
++    physical_by_logical = tuple(
++        np.flatnonzero(physical_to_logical == logical)
++        for logical in range(logical_load.size)
++    )
++    logical_order = sorted(
++        range(logical_load.size),
++        key=lambda logical: (
++            -float(physical_copy_load[physical_by_logical[logical]].max()),
++            logical,
++        ),
++    )
++    physical_order = [
++        int(physical)
++        for logical in logical_order
++        for physical in sorted(
++            physical_by_logical[logical].tolist(),
++            key=lambda physical: (-float(physical_copy_load[physical]), physical),
++        )
++    ]
++    for physical in physical_order:
++        logical = int(physical_to_logical[physical])
++        copies_by_node = np.zeros(num_nodes, dtype=np.int64)
++        for selected in selected_ranks[logical]:
++            copies_by_node[selected // ranks_per_node] += 1
++
++        eligible = [
++            rank
++            for rank in range(num_ranks)
++            if rank_remaining[rank] > 0
++            and rank not in selected_ranks[logical]
++        ]
++        if not eligible:
++            raise RuntimeError(
++                "rank capacities cannot realize a duplicate-free "
++                f"placement for logical expert {logical}"
++            )
++
++        ordered_candidates = sorted(
++            eligible,
++            key=lambda rank: (
++                float(rank_load[rank]),
++                int(copies_by_node[rank // ranks_per_node]),
++                -int(rank_remaining[rank]),
++                rank,
++            ),
++        )
++        target = None
++        for candidate in ordered_candidates:
++            remaining_copies[logical] -= 1
++            rank_remaining[candidate] -= 1
++            selected_ranks[logical].add(candidate)
++            if _residual_placement_is_feasible(
++                remaining_copies,
++                rank_remaining,
++                selected_ranks,
++            ):
++                target = candidate
++                break
++            selected_ranks[logical].remove(candidate)
++            rank_remaining[candidate] += 1
++            remaining_copies[logical] += 1
++
++        if target is None:
++            raise RuntimeError(
++                "no load-ordered rank preserves residual placement "
++                f"feasibility for logical expert {logical}"
++            )
++
++        physical_to_rank[physical] = target
++        rank_lists[target].append(logical)
++        rank_load[target] += physical_copy_load[physical]
++        rank_count[target] += 1
++
++    if not np.array_equal(rank_count, rank_capacity):
++        raise RuntimeError(
++            f"placement did not fill capacities: {rank_count} != {rank_capacity}"
++        )
++    if np.any(remaining_copies != 0) or np.any(rank_remaining != 0):
++        raise RuntimeError("placement left a non-empty residual degree sequence")
++    # Runtime enumerates a logical expert's copies in physical rank order.
++    # Canonicalize the otherwise interchangeable planner copy ids to that order.
++    for logical in range(logical_load.size):
++        physical = np.flatnonzero(physical_to_logical == logical)
++        physical_to_rank[physical] = np.sort(physical_to_rank[physical])
++    placement = tuple(np.asarray(values, dtype=np.int64) for values in rank_lists)
++    return placement, physical_to_rank
++
++
++def build_layer_placement(
++    aggregate_load: np.ndarray,
++    replica_count_by_layer: Sequence[int] | np.ndarray,
++    num_ranks: int,
++    *,
++    num_nodes: int = 1,
++) -> tuple[
++    np.ndarray,
++    Placement,
++    tuple[np.ndarray, ...],
++    tuple[np.ndarray, ...],
++    np.ndarray,
++]:
++    """Build capacities and physical placement for a layer replica vector."""
++
++    weights = np.asarray(aggregate_load, dtype=np.float64)
++    replicas = _strict_integer_array(
++        replica_count_by_layer,
++        "replica_count_by_layer",
++        ndim=1,
++    )
++    if weights.ndim != 2:
++        raise ValueError(f"aggregate_load must have shape [L, E], got {weights.shape}")
++    if replicas.shape != (weights.shape[0],):
++        raise ValueError(
++            f"replica vector must have shape {(weights.shape[0],)}, got {replicas.shape}"
++        )
++    if np.any(replicas < 0):
++        raise ValueError("replica counts must be non-negative")
++
++    num_layers, num_experts = weights.shape
++    capacities = capacity_aware_interleaving(
++        num_experts + replicas,
++        num_ranks,
++    )
++    placements: list[tuple[np.ndarray, ...]] = []
++    physical_to_logical: list[np.ndarray] = []
++    physical_to_rank: list[np.ndarray] = []
++    copy_counts = np.empty((num_layers, num_experts), dtype=np.int64)
++
++    for layer in range(num_layers):
++        phy2log, copies = _replicate_layer(
++            weights[layer],
++            int(replicas[layer]),
++            num_ranks,
++        )
++        placement, phy2rank = _place_layer(
++            phy2log,
++            weights[layer],
++            copies,
++            capacities[layer],
++            num_nodes,
++        )
++        placements.append(placement)
++        physical_to_logical.append(phy2log)
++        physical_to_rank.append(phy2rank)
++        copy_counts[layer] = copies
++
++    return (
++        capacities,
++        tuple(placements),
++        tuple(physical_to_logical),
++        tuple(physical_to_rank),
++        copy_counts,
++    )
++
++
++def replay_balancedness(
++    expert_load: np.ndarray | Sequence[object],
++    physical_to_logical: Sequence[np.ndarray],
++    physical_to_rank: Sequence[np.ndarray],
++    logical_copy_count: np.ndarray,
++    num_ranks: int,
++) -> np.ndarray:
++    """Replay source-rank modulo routing and return per-layer balancedness.
++
++    The runtime sends all traffic from source rank ``s`` to copy
++    ``s % copy_count``. The profile contains cluster-aggregate logical load,
++    so each source rank contributes one ``1 / num_ranks`` share. This differs
++    from equal ``load / copy_count`` splitting whenever the copy count does
++    not divide the EP size, notably for three and five copies on eight ranks.
++    """
++
++    load = _normalise_load(expert_load)
++    num_ranks = _strict_integer(num_ranks, "num_ranks", minimum=1)
++    num_batches, num_layers, num_experts = load.shape
++    if len(physical_to_logical) != num_layers or len(physical_to_rank) != num_layers:
++        raise ValueError("placement layer count does not match expert_load")
++    copy_table = _strict_integer_array(
++        logical_copy_count,
++        "logical_copy_count",
++        ndim=2,
++    )
++    if copy_table.shape != (num_layers, num_experts):
++        raise ValueError(
++            "logical_copy_count must have shape "
++            f"{(num_layers, num_experts)}, got {copy_table.shape}"
++        )
++    if np.any(copy_table < 1) or np.any(copy_table > num_ranks):
++        raise ValueError("logical_copy_count entries must be in [1, num_ranks]")
++
++    result = np.empty(num_layers, dtype=np.float64)
++    for layer in range(num_layers):
++        phy2log = _strict_integer_array(
++            physical_to_logical[layer],
++            f"physical_to_logical[{layer}]",
++            ndim=1,
++        )
++        phy2rank = _strict_integer_array(
++            physical_to_rank[layer],
++            f"physical_to_rank[{layer}]",
++            ndim=1,
++        )
++        if phy2log.shape != phy2rank.shape:
++            raise ValueError(f"layer {layer} physical maps have different shapes")
++        if np.any(phy2log < 0) or np.any(phy2log >= num_experts):
++            raise ValueError(f"layer {layer} contains an invalid logical expert id")
++        if np.any(phy2rank < 0) or np.any(phy2rank >= num_ranks):
++            raise ValueError(f"layer {layer} contains an invalid rank id")
++
++        actual_copy_count = np.bincount(phy2log, minlength=num_experts)
++        if not np.array_equal(actual_copy_count, copy_table[layer]):
++            raise ValueError(f"layer {layer} physical maps do not match logical_copy_count")
++        gpu_load = np.zeros((num_batches, num_ranks), dtype=np.float64)
++        for logical in range(num_experts):
++            physical = np.flatnonzero(phy2log == logical)
++            physical = physical[np.argsort(phy2rank[physical], kind="stable")]
++            target_ranks = phy2rank[physical]
++            if np.unique(target_ranks).size != target_ranks.size:
++                raise ValueError(
++                    f"layer {layer} logical expert {logical} has two copies on one rank"
++                )
++            source_counts = _source_ranks_per_copy(physical.size, num_ranks)
++            for copy_index, rank in enumerate(target_ranks.tolist()):
++                gpu_load[:, rank] += (
++                    load[:, layer, logical]
++                    * float(source_counts[copy_index])
++                    / num_ranks
++                )
++
++        maximum = gpu_load.max(axis=1)
++        balancedness = np.ones(num_batches, dtype=np.float64)
++        nonzero = maximum > 0
++        balancedness[nonzero] = (
++            gpu_load[nonzero].mean(axis=1) / maximum[nonzero]
++        )
++        result[layer] = balancedness.mean()
++    return result
+diff --git a/vllm_ascend/eplb/core/policy/policy_factory.py b/vllm_ascend/eplb/core/policy/policy_factory.py
+index 9fe80007a..c3b8c0d3c 100644
+--- a/vllm_ascend/eplb/core/policy/policy_factory.py
++++ b/vllm_ascend/eplb/core/policy/policy_factory.py
+@@ -5,13 +5,15 @@ from vllm.logger import logger
+ from .policy_abstract import EplbPolicy
+ from .policy_default_eplb import DefaultEplb
+ from .policy_flashlb import FlashLB, warm_up
++from .policy_global_expert_pool import GlobalExpertPoolEplb
++from .policy_layer import LayerEplb
+ from .policy_random import RandomLoadBalance
+ from .policy_swift_balancer import SwiftBalanceEplb
+ 
+ 
+ class PolicyFactory:
+     @staticmethod
+-    def generate_policy(policy_type: int) -> EplbPolicy:
++    def generate_policy(policy_type: int, policy_config: dict | None = None) -> EplbPolicy:
+         policy: dict[int, type[EplbPolicy]] = {
+             # Constraint applying Dynamic EPLB policy V2:
+             # If there exists redundant expert:
+@@ -24,8 +26,16 @@ class PolicyFactory:
+             # FlashLB EPLB policy: expert replacement based on Joint Optimization,
+             # Multi-Shot Enhancement and Incremental Adjustment
+             3: FlashLB,
++            # Role-aware policy: cross-layer slots for prefill, per-layer
++            # redundant experts for decode.
++            4: GlobalExpertPoolEplb,
+         }
+         policy_class = policy.get(policy_type)
++        if policy_type == 4:
++            node_role = (policy_config or {}).get("node_role", "prefill")
++            if node_role not in ("prefill", "decode"):
++                raise ValueError("policy 4 node_role must be 'prefill' or 'decode'")
++            policy_class = GlobalExpertPoolEplb if node_role == "prefill" else LayerEplb
+         if policy_class is None:
+             policy_class = RandomLoadBalance
+             logger.warning(
+@@ -35,7 +45,12 @@ class PolicyFactory:
+             )
+         else:
+             logger.info("[eplb/policy] Policy: %s (type=%s)", policy_class.__name__, policy_type)
+-        policy_instance = policy_class()
++        if policy_type == 4:
++            constructor_config = dict(policy_config or {})
++            constructor_config.pop("node_role", None)
++            policy_instance = policy_class(**constructor_config)
++        else:
++            policy_instance = policy_class()
+         if policy_type == 3:
+             warm_up()
+         return policy_instance
+diff --git a/vllm_ascend/eplb/core/policy/policy_global_expert_pool.py b/vllm_ascend/eplb/core/policy/policy_global_expert_pool.py
+new file mode 100644
+index 000000000..63c1d6b01
+--- /dev/null
++++ b/vllm_ascend/eplb/core/policy/policy_global_expert_pool.py
+@@ -0,0 +1,329 @@
++# SPDX-License-Identifier: Apache-2.0
++"""P-node global expert pool policy using cross-layer shared slots."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import numpy as np
++
++from .policy_abstract import EplbPolicy
++
++_SLOT_GAIN_EPSILON = 1e-12
++# Policy 4 owns its stability and migration thresholds. Keeping these values
++# internal avoids a second set of user-facing tuning knobs and, importantly,
++# prevents low-signal decode windows from forcing repeated weight migration.
++_MIN_EFFECTIVE_GAIN = 0.01
++_REQUIRED_STABLE_WINDOWS = 2
++_POST_APPLY_COOLDOWN_WINDOWS = 1
++_MIGRATION_AMORTIZATION_WINDOWS = 4.0
++_NORMALIZED_MIGRATION_COST = 0.02
++_HEAT_EMA_ALPHA = 0.25
++
++
++@dataclass(frozen=True)
++class GlobalExpertPoolDecision:
++    should_apply: bool
++    reason: str
++    placement: tuple[tuple[tuple[int, ...], ...], ...]
++    priority: tuple[float, ...]
++    gain: float
++    changed_slots: int
++
++
++def _logical_heat(table: np.ndarray, workload: np.ndarray, num_experts: int) -> np.ndarray:
++    heat = np.zeros((table.shape[0], num_experts), dtype=np.float64)
++    for layer_id in range(table.shape[0]):
++        valid = table[layer_id] >= 0
++        np.add.at(heat[layer_id], table[layer_id][valid], workload[layer_id][valid])
++    return heat
++
++
++def _routing_shares(holders: np.ndarray) -> np.ndarray:
++    """Replay ascending-holder ``source_rank % copies`` routing.
++
++    Only aggregate logical heat is available, so source ranks are assumed to
++    contribute equally. This matches the runtime routing rule, not arbitrary
++    source-rank traffic skew. Adding a lower-ranked holder changes the ordinal
++    (and potentially the share) of existing copies as well.
++    """
++    num_ranks = holders.shape[-1]
++    copies = holders.sum(axis=-1, keepdims=True)
++    if np.any(copies == 0):
++        raise ValueError("each logical expert must have at least one holder")
++    ordinal = np.cumsum(holders, axis=-1) - 1
++    source_counts = num_ranks // copies + (ordinal < num_ranks % copies)
++    return np.where(holders, source_counts / num_ranks, 0.0)
++
++
++def _allocate_critical_path_replicas(
++    base: np.ndarray,
++    heat: np.ndarray,
++    slots_per_rank: int,
++    num_ranks: int,
++) -> list[list[tuple[int, int]]]:
++    """Greedily minimize the summed per-layer critical path under routing.
++
++    Evaluate one destination rank at a time to avoid materializing a
++    [layers, experts, destination ranks, holder ranks] tensor.
++    """
++    num_layers, _, _ = base.shape
++    num_experts = heat.shape[1]
++    holders = np.zeros((num_layers, num_experts, num_ranks), dtype=bool)
++    for layer_id in range(num_layers):
++        for rank_id in range(num_ranks):
++            holders[layer_id, base[layer_id, rank_id], rank_id] = True
++
++    contributions = heat[:, :, None] * _routing_shares(holders)
++    rank_load = contributions.sum(axis=1)
++    remaining = np.full(num_ranks, slots_per_rank, dtype=np.int64)
++    targets_by_rank: list[list[tuple[int, int]]] = [[] for _ in range(num_ranks)]
++
++    for _ in range(slots_per_rank * num_ranks):
++        critical_gain = np.full(holders.shape, -np.inf)
++        second_moment_gain = np.full(holders.shape, -np.inf)
++        peak = rank_load.max(axis=-1)[:, None]
++        second_moment = np.square(rank_load).sum(axis=-1)[:, None]
++        for rank_id in range(num_ranks):
++            if remaining[rank_id] == 0:
++                continue
++            proposed = holders.copy()
++            proposed[:, :, rank_id] = True
++            candidate_loads = rank_load[:, None, :] - contributions + heat[:, :, None] * _routing_shares(proposed)
++            valid = (~holders[:, :, rank_id]) & (heat > 0)
++            critical_gain[:, :, rank_id] = np.where(valid, peak - candidate_loads.max(axis=-1), -np.inf)
++            second_moment_gain[:, :, rank_id] = np.where(
++                valid, second_moment - np.square(candidate_loads).sum(axis=-1), -np.inf
++            )
++
++        best_primary = float(np.max(critical_gain))
++        if not np.isfinite(best_primary):
++            break
++        if best_primary > _SLOT_GAIN_EPSILON:
++            eligible = critical_gain >= best_primary - _SLOT_GAIN_EPSILON
++        else:
++            # A second-moment improvement must not increase the critical path.
++            eligible = critical_gain >= -_SLOT_GAIN_EPSILON
++        score = np.where(eligible, second_moment_gain, -np.inf)
++        if best_primary <= _SLOT_GAIN_EPSILON and float(np.max(score)) <= _SLOT_GAIN_EPSILON:
++            break
++
++        layer_id, expert_id, rank_id = (int(value) for value in np.unravel_index(int(np.argmax(score)), score.shape))
++        holders[layer_id, expert_id, rank_id] = True
++        updated = heat[layer_id, expert_id] * _routing_shares(holders[layer_id, expert_id])
++        rank_load[layer_id] += updated - contributions[layer_id, expert_id]
++        contributions[layer_id, expert_id] = updated
++        remaining[rank_id] -= 1
++        targets_by_rank[rank_id].append((layer_id, expert_id))
++
++    return targets_by_rank
++
++
++def _align_shared_slots(
++    current: np.ndarray,
++    base_slots: int,
++    targets_by_rank: list[list[tuple[int, int]]],
++) -> np.ndarray:
++    candidate = current.copy()
++    candidate[:, :, base_slots:] = -1
++    num_layers, num_ranks, local_slots = current.shape
++    shared_slots = local_slots - base_slots
++    for rank_id in range(num_ranks):
++        remaining = list(targets_by_rank[rank_id])
++        assigned: list[tuple[int, int] | None] = [None] * shared_slots
++        old_owner: list[tuple[int, int] | None] = []
++        for slot_id in range(shared_slots):
++            owners = [
++                (layer_id, int(current[layer_id, rank_id, base_slots + slot_id]))
++                for layer_id in range(num_layers)
++                if current[layer_id, rank_id, base_slots + slot_id] >= 0
++            ]
++            if len(owners) > 1:
++                raise ValueError("one shared physical slot is owned by multiple layers")
++            old_owner.append(owners[0] if owners else None)
++        for slot_id, owner in enumerate(old_owner):
++            if owner is not None and owner in remaining:
++                assigned[slot_id] = owner
++                remaining.remove(owner)
++        for slot_id, owner in enumerate(old_owner):
++            if assigned[slot_id] is not None or owner is None:
++                continue
++            same_layer = next((item for item in remaining if item[0] == owner[0]), None)
++            if same_layer is not None:
++                assigned[slot_id] = same_layer
++                remaining.remove(same_layer)
++        remaining.sort()
++        for slot_id in range(shared_slots):
++            if assigned[slot_id] is None and remaining:
++                assigned[slot_id] = remaining.pop(0)
++        if remaining:
++            raise ValueError("target placement exceeds the shared slot budget")
++        for slot_id, owner in enumerate(assigned):
++            if owner is not None:
++                layer_id, expert_id = owner
++                candidate[layer_id, rank_id, base_slots + slot_id] = expert_id
++    return candidate
++
++
++def _rank_loads_by_layer(table: np.ndarray, heat: np.ndarray, num_ranks: int) -> np.ndarray:
++    holders = np.zeros((table.shape[0], heat.shape[1], num_ranks), dtype=bool)
++    for layer_id in range(table.shape[0]):
++        for rank_id in range(num_ranks):
++            experts = table[layer_id, rank_id]
++            holders[layer_id, experts[experts >= 0], rank_id] = True
++    return (heat[:, :, None] * _routing_shares(holders)).sum(axis=1)
++
++
++def _immutable(table: np.ndarray) -> tuple[tuple[tuple[int, ...], ...], ...]:
++    return tuple(tuple(tuple(int(value) for value in rank) for rank in layer) for layer in table)
++
++
++class GlobalExpertPoolPlanner:
++    """Plan shared slots with conservative, implementation-owned gating."""
++
++    def __init__(self, num_redundant_experts: int) -> None:
++        if isinstance(num_redundant_experts, bool) or not isinstance(num_redundant_experts, int):
++            raise TypeError("num_redundant_experts must be an integer")
++        if num_redundant_experts <= 0:
++            raise ValueError("policy 4 requires num_redundant_experts > 0")
++        self.slots_per_rank = int(num_redundant_experts)
++        self._heat_distribution_ema: np.ndarray | None = None
++        self._last_candidate: np.ndarray | None = None
++        self._pending_base: np.ndarray | None = None
++        self._stable_windows = 0
++        self._cooldown_remaining = 0
++
++    def _smooth_heat_distribution(self, heat: np.ndarray) -> np.ndarray:
++        totals = heat.sum(axis=-1, keepdims=True)
++        distribution = np.divide(
++            heat,
++            totals,
++            out=np.zeros_like(heat, dtype=np.float64),
++            where=totals > 0,
++        )
++        if self._heat_distribution_ema is None or self._heat_distribution_ema.shape != distribution.shape:
++            smoothed = distribution
++        else:
++            smoothed = self._heat_distribution_ema.copy()
++            observed = totals[:, 0] > 0
++            smoothed[observed] = (1.0 - _HEAT_EMA_ALPHA) * smoothed[observed] + _HEAT_EMA_ALPHA * distribution[observed]
++            smoothed_totals = smoothed.sum(axis=-1, keepdims=True)
++            smoothed = np.divide(
++                smoothed,
++                smoothed_totals,
++                out=np.zeros_like(smoothed),
++                where=smoothed_totals > 0,
++            )
++        self._heat_distribution_ema = smoothed.copy()
++        return smoothed * totals
++
++    def plan(self, current_expert_table: Any, expert_workload: Any) -> GlobalExpertPoolDecision:
++        table = np.asarray(current_expert_table, dtype=np.int64)
++        workload = np.asarray(expert_workload, dtype=np.float64)
++        if table.ndim != 3 or workload.shape != table.shape or 0 in table.shape:
++            raise ValueError("policy 4 expects matching non-empty [layers, ranks, local_slots] table and workload")
++        if not np.all(np.isfinite(workload)) or np.any(workload < 0):
++            raise ValueError("policy 4 workload must be non-negative and finite")
++        num_layers, num_ranks, local_slots = table.shape
++        base_slots = local_slots - self.slots_per_rank
++        if base_slots <= 0:
++            raise ValueError("global slots must be smaller than local physical capacity")
++        num_experts = base_slots * num_ranks
++        for layer_id in range(num_layers):
++            base = table[layer_id, :, :base_slots].reshape(-1)
++            if np.any(base < 0) or not np.array_equal(np.sort(base), np.arange(num_experts)):
++                raise ValueError(f"layer {layer_id} base slots must contain one immutable copy per expert")
++
++        heat = self._smooth_heat_distribution(_logical_heat(table, workload, num_experts))
++        targets_by_rank = _allocate_critical_path_replicas(
++            table[:, :, :base_slots], heat, self.slots_per_rank, num_ranks
++        )
++
++        candidate = _align_shared_slots(table, base_slots, targets_by_rank)
++        current_rank_loads = _rank_loads_by_layer(table, heat, num_ranks)
++        # Stability tracks sustained benefit, not identical greedy tie breaks.
++        # Revalidate the pending placement against fresh heat and the same base.
++        if (
++            self._last_candidate is not None
++            and self._pending_base is not None
++            and np.array_equal(table, self._pending_base)
++        ):
++            pending_loads = _rank_loads_by_layer(self._last_candidate, heat, num_ranks)
++            current_peak = current_rank_loads.max(axis=-1)
++            pending_gain = float((current_peak - pending_loads.max(axis=-1)).sum()) / max(
++                float(current_peak.sum()), _SLOT_GAIN_EPSILON
++            )
++            pending_changes = int(np.count_nonzero(np.any(
++                self._last_candidate[:, :, base_slots:] != table[:, :, base_slots:], axis=0
++            )))
++            pending_cost = (
++                _NORMALIZED_MIGRATION_COST * pending_changes
++                / max(1, self.slots_per_rank * num_ranks)
++                / _MIGRATION_AMORTIZATION_WINDOWS
++            )
++            if pending_changes > 0 and pending_gain - pending_cost >= _MIN_EFFECTIVE_GAIN:
++                candidate = self._last_candidate.copy()
++        else:
++            self._last_candidate = None
++            self._stable_windows = 0
++        predicted_rank_loads = _rank_loads_by_layer(candidate, heat, num_ranks)
++        current_critical_path = current_rank_loads.max(axis=-1)
++        predicted_critical_path = predicted_rank_loads.max(axis=-1)
++        priority = current_critical_path - predicted_critical_path
++        raw_gain = float(priority.sum()) / max(float(current_critical_path.sum()), _SLOT_GAIN_EPSILON)
++        changed_slots = int(np.count_nonzero(np.any(candidate[:, :, base_slots:] != table[:, :, base_slots:], axis=0)))
++        migration_penalty = (
++            _NORMALIZED_MIGRATION_COST
++            * changed_slots
++            / max(1, self.slots_per_rank * num_ranks)
++            / _MIGRATION_AMORTIZATION_WINDOWS
++        )
++        effective_gain = raw_gain - migration_penalty
++        if self._last_candidate is not None and np.array_equal(candidate, self._last_candidate):
++            self._stable_windows += 1
++        else:
++            self._last_candidate = candidate.copy()
++            self._pending_base = table.copy()
++            self._stable_windows = 1
++
++        reason, should_apply = "apply", True
++        if changed_slots == 0:
++            reason, should_apply = "unchanged", False
++        elif effective_gain < _MIN_EFFECTIVE_GAIN:
++            reason, should_apply = "insufficient_gain", False
++        elif self._stable_windows < _REQUIRED_STABLE_WINDOWS:
++            reason, should_apply = "unstable", False
++        elif self._cooldown_remaining > 0:
++            reason, should_apply = "cooldown", False
++        if self._cooldown_remaining > 0:
++            self._cooldown_remaining -= 1
++        if should_apply:
++            self._cooldown_remaining = _POST_APPLY_COOLDOWN_WINDOWS
++        if should_apply or changed_slots == 0 or effective_gain < _MIN_EFFECTIVE_GAIN:
++            self._last_candidate = None
++            self._pending_base = None
++            self._stable_windows = 0
++
++        return GlobalExpertPoolDecision(
++            should_apply=should_apply,
++            reason=reason,
++            placement=_immutable(candidate if should_apply else table),
++            priority=tuple(float(value) for value in priority),
++            gain=effective_gain,
++            changed_slots=changed_slots,
++        )
++
++
++class GlobalExpertPoolEplb(EplbPolicy):
++    def __init__(self, num_redundant_experts: int) -> None:
++        self.planner = GlobalExpertPoolPlanner(num_redundant_experts)
++        self.last_decision: GlobalExpertPoolDecision | None = None
++
++    def rebalance_experts(self, current_expert_table, expert_workload):
++        self.last_decision = self.planner.plan(current_expert_table, expert_workload)
++        decision = self.last_decision
++        return int(decision.should_apply), np.asarray(decision.priority), decision.placement
++
++
++__all__ = ["GlobalExpertPoolEplb"]
+diff --git a/vllm_ascend/eplb/core/policy/policy_layer.py b/vllm_ascend/eplb/core/policy/policy_layer.py
+new file mode 100644
+index 000000000..99fb1e06e
+--- /dev/null
++++ b/vllm_ascend/eplb/core/policy/policy_layer.py
+@@ -0,0 +1,350 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Dynamic per-layer placement for the fixed-capacity EPLB runtime."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++
++from .policy_abstract import EplbPolicy
++from .layer_placement import build_layer_placement, replay_balancedness
++
++
++_PER_LAYER_GAIN_EPSILON = 1e-12
++_MAX_MIGRATION_LAYER_FRACTION = 0.25
++_MIN_EFFECTIVE_GAIN = 0.02
++_REQUIRED_STABLE_WINDOWS = 2
++_POST_APPLY_COOLDOWN_WINDOWS = 1
++_MIGRATION_AMORTIZATION_WINDOWS = 4.0
++_NORMALIZED_MIGRATION_COST = 0.02
++
++
++@dataclass(frozen=True)
++class LayerDecision:
++    should_apply: bool
++    placement: tuple[tuple[tuple[int, ...], ...], ...]
++    priority: tuple[int, ...]
++
++
++def _numpy(value, dtype) -> np.ndarray:
++    if hasattr(value, "detach"):
++        value = value.detach().cpu().numpy()
++    return np.asarray(value, dtype=dtype)
++
++
++def _inputs(current_expert_table, expert_workload) -> tuple[np.ndarray, np.ndarray, int]:
++    table = _numpy(current_expert_table, np.int64).copy()
++    load = _numpy(expert_workload, np.float64).copy()
++    if table.ndim != 3 or table.shape != load.shape or 0 in table.shape:
++        raise ValueError("Policy4 expects matching non-empty [L, R, S] table and load")
++    if np.any(table < 0) or not np.all(np.isfinite(load)) or np.any(load < 0):
++        raise ValueError("Policy4 table and load must be non-negative and finite")
++    num_experts = int(table.max()) + 1
++    expected = np.arange(num_experts, dtype=np.int64)
++    for layer in table:
++        if not np.array_equal(np.unique(layer), expected):
++            raise ValueError("Policy4 placement must cover every logical expert")
++        for rank in layer:
++            if np.unique(rank).size != rank.size:
++                raise ValueError("Policy4 cannot place two copies on one rank")
++    return table, load, num_experts
++
++
++def _logical_heat(table: np.ndarray, load: np.ndarray, num_experts: int) -> np.ndarray:
++    heat = np.zeros((table.shape[0], num_experts), dtype=np.float64)
++    for layer in range(table.shape[0]):
++        np.add.at(heat[layer], table[layer].reshape(-1), load[layer].reshape(-1))
++    return heat
++
++
++def _placement_maps(table: np.ndarray, num_experts: int):
++    phy2log = []
++    phy2rank = []
++    copies = np.empty((table.shape[0], num_experts), dtype=np.int64)
++    for layer in range(table.shape[0]):
++        logical = table[layer].reshape(-1)
++        phy2log.append(logical)
++        phy2rank.append(np.repeat(np.arange(table.shape[1]), table.shape[2]))
++        copies[layer] = np.bincount(logical, minlength=num_experts)
++    return tuple(phy2log), tuple(phy2rank), copies
++
++
++def _placement_risk_by_layer(
++    current: np.ndarray,
++    candidate: np.ndarray,
++    heat: np.ndarray,
++    num_experts: int,
++) -> np.ndarray:
++    """Estimate migration and communication-locality risk per layer.
++
++    The runtime currently exposes logical-expert heat, but not a
++    source-rank-to-expert traffic matrix.  Retaining the current owners of hot
++    experts is therefore the safest available locality proxy.  Peak per-rank
++    slot churn additionally avoids concentrating weight transfers on one rank.
++    """
++    changed = candidate != current
++    mean_rank_churn = changed.mean(axis=(1, 2))
++    peak_rank_churn = changed.mean(axis=2).max(axis=1)
++
++    current_owners = np.zeros(
++        (current.shape[0], num_experts, current.shape[1]), dtype=bool
++    )
++    candidate_owners = np.zeros_like(current_owners)
++    for layer in range(current.shape[0]):
++        for rank in range(current.shape[1]):
++            current_owners[layer, current[layer, rank], rank] = True
++            candidate_owners[layer, candidate[layer, rank], rank] = True
++
++    current_copies = current_owners.sum(axis=2)
++    retired_owner_fraction = np.divide(
++        np.count_nonzero(current_owners & ~candidate_owners, axis=2),
++        current_copies,
++        out=np.zeros_like(current_copies, dtype=np.float64),
++        where=current_copies != 0,
++    )
++    total_heat = heat.sum(axis=1)
++    hot_owner_churn = np.divide(
++        (heat * retired_owner_fraction).sum(axis=1),
++        total_heat,
++        out=np.zeros_like(total_heat, dtype=np.float64),
++        where=total_heat != 0,
++    )
++
++    return (mean_rank_churn + peak_rank_churn + hot_owner_churn) / 3.0
++
++
++def _align_retained_slots(current: np.ndarray, desired) -> np.ndarray:
++    result = np.full_like(current, -1)
++    for layer in range(current.shape[0]):
++        for rank in range(current.shape[1]):
++            wanted = [int(item) for item in desired[layer][rank]]
++            wanted_set = set(wanted)
++            retained = set()
++            for slot, expert in enumerate(current[layer, rank]):
++                if int(expert) in wanted_set:
++                    result[layer, rank, slot] = expert
++                    retained.add(int(expert))
++            remaining = (item for item in wanted if item not in retained)
++            for slot in np.flatnonzero(result[layer, rank] < 0):
++                result[layer, rank, slot] = next(remaining)
++    return result
++
++
++def _immutable(table: np.ndarray):
++    return tuple(
++        tuple(tuple(int(value) for value in rank) for rank in layer)
++        for layer in table
++    )
++
++
++class LayerPlanner:
++    """Plan stable per-layer placements using implementation-owned thresholds."""
++
++    def __init__(self, num_redundant_experts: int) -> None:
++        if isinstance(num_redundant_experts, bool) or not isinstance(
++            num_redundant_experts, int
++        ):
++            raise TypeError("num_redundant_experts must be an integer")
++        if num_redundant_experts <= 0:
++            raise ValueError("num_redundant_experts must be positive")
++        self.num_redundant_experts = num_redundant_experts
++        self.window = 0
++        self.last_apply_window: int | None = None
++        self.pending: np.ndarray | None = None
++        self.pending_base: np.ndarray | None = None
++        self.pending_streak = 0
++
++    @staticmethod
++    def _scores(table: np.ndarray, heat: np.ndarray, num_experts: int) -> np.ndarray:
++        return replay_balancedness(
++            heat, *_placement_maps(table, num_experts), table.shape[1]
++        )
++
++    @classmethod
++    def _limit_migration_scope(
++        cls,
++        current: np.ndarray,
++        candidate: np.ndarray,
++        current_score: np.ndarray,
++        heat: np.ndarray,
++        num_experts: int,
++    ) -> np.ndarray:
++        changed_by_layer = np.count_nonzero(candidate != current, axis=(1, 2))
++        changed_layers = np.flatnonzero(changed_by_layer)
++        if changed_layers.size == 0:
++            return candidate
++
++        gain_by_layer = cls._scores(candidate, heat, num_experts) - current_score
++        risk_by_layer = _placement_risk_by_layer(
++            current, candidate, heat, num_experts
++        )
++        net_gain_by_layer = (
++            gain_by_layer * _MIGRATION_AMORTIZATION_WINDOWS
++            - risk_by_layer * _NORMALIZED_MIGRATION_COST
++        )
++        profitable_layers = changed_layers[
++            net_gain_by_layer[changed_layers] > _PER_LAYER_GAIN_EPSILON
++        ]
++        if profitable_layers.size == 0:
++            return current.copy()
++
++        max_layers = max(
++            1,
++            int(np.ceil(current.shape[0] * _MAX_MIGRATION_LAYER_FRACTION)),
++        )
++        selected_layers = sorted(
++            profitable_layers.tolist(),
++            key=lambda layer: (
++                -float(net_gain_by_layer[layer]),
++                -float(
++                    gain_by_layer[layer]
++                    / max(risk_by_layer[layer], _PER_LAYER_GAIN_EPSILON)
++                ),
++                -float(gain_by_layer[layer]),
++                layer,
++            ),
++        )[:max_layers]
++        limited = current.copy()
++        limited[selected_layers] = candidate[selected_layers]
++        return limited
++
++    def _eligible(
++        self,
++        current: np.ndarray,
++        candidate: np.ndarray,
++        current_score: np.ndarray,
++        heat: np.ndarray,
++        num_experts: int,
++    ) -> tuple[bool, np.ndarray]:
++        predicted = self._scores(candidate, heat, num_experts)
++        per_layer_gain = predicted - current_score
++        gain = float(per_layer_gain.mean())
++        changed = int(np.count_nonzero(candidate != current))
++        placement_risk = _placement_risk_by_layer(
++            current, candidate, heat, num_experts
++        )
++        cost = float(placement_risk.mean()) * _NORMALIZED_MIGRATION_COST
++        ready = (
++            changed > 0
++            and gain >= _MIN_EFFECTIVE_GAIN
++            and float(per_layer_gain.min()) >= -_PER_LAYER_GAIN_EPSILON
++            and gain * _MIGRATION_AMORTIZATION_WINDOWS > cost
++        )
++        return ready, per_layer_gain
++
++    def plan(self, current_expert_table, expert_workload) -> LayerDecision:
++        table, load, num_experts = _inputs(current_expert_table, expert_workload)
++        self.window += 1
++        heat = _logical_heat(table, load, num_experts)
++        current_by_layer = self._scores(table, heat, num_experts)
++        replicas = table.shape[1] * table.shape[2] - num_experts
++        if replicas != self.num_redundant_experts:
++            raise ValueError(
++                "Policy4 runtime placement has "
++                f"{replicas} redundant experts, expected "
++                f"{self.num_redundant_experts} from configuration"
++            )
++        _, desired, _, _, _ = build_layer_placement(
++            heat, np.full(table.shape[0], replicas), table.shape[1]
++        )
++        candidate = _align_retained_slots(table, desired)
++        candidate = self._limit_migration_scope(
++            table,
++            candidate,
++            current_by_layer,
++            heat,
++            num_experts,
++        )
++
++        fresh_ready, fresh_gain_by_layer = self._eligible(
++            table, candidate, current_by_layer, heat, num_experts
++        )
++        selected = candidate
++        selected_ready = fresh_ready
++        selected_gain_by_layer = fresh_gain_by_layer
++
++        base_unchanged = (
++            self.pending_base is not None
++            and np.array_equal(self.pending_base, table)
++        )
++        if not fresh_ready:
++            self.pending = None
++            self.pending_base = None
++            self.pending_streak = 0
++        elif self.pending is None or not base_unchanged:
++            self.pending = candidate.copy()
++            self.pending_base = table.copy()
++            self.pending_streak = 1
++        elif np.array_equal(self.pending, candidate):
++            self.pending_streak += 1
++            selected = self.pending
++        else:
++            pending_ready, pending_gains = self._eligible(
++                table, self.pending, current_by_layer, heat, num_experts
++            )
++            # Stability means that the incumbent remains beneficial under a
++            # fresh load window, not that a deterministic optimizer reproduces
++            # the same placement. Chasing every newly optimal placement keeps
++            # resetting the streak on otherwise stable traffic and can prevent
++            # EPLB from ever applying a valid plan.
++            if pending_ready:
++                self.pending_streak += 1
++                selected = self.pending
++                selected_ready = True
++                selected_gain_by_layer = pending_gains
++            else:
++                self.pending = candidate.copy()
++                self.pending_base = table.copy()
++                self.pending_streak = 1
++
++        cooldown = (
++            self.last_apply_window is not None
++            and self.window - self.last_apply_window
++            <= _POST_APPLY_COOLDOWN_WINDOWS
++        )
++        should_apply = (
++            selected_ready
++            and self.pending_streak >= _REQUIRED_STABLE_WINDOWS
++            and not cooldown
++        )
++        if should_apply:
++            self.last_apply_window = self.window
++            self.pending = None
++            self.pending_base = None
++            self.pending_streak = 0
++
++        selected_risk_by_layer = _placement_risk_by_layer(
++            table, selected, heat, num_experts
++        )
++        selected_net_gain_by_layer = (
++            selected_gain_by_layer * _MIGRATION_AMORTIZATION_WINDOWS
++            - selected_risk_by_layer * _NORMALIZED_MIGRATION_COST
++        )
++        priority = tuple(
++            int(value)
++            for value in np.argsort(-selected_net_gain_by_layer, kind="stable")
++        )
++        return LayerDecision(
++            should_apply=should_apply,
++            placement=_immutable(selected if should_apply else table),
++            priority=priority,
++        )
++
++
++class LayerEplb(EplbPolicy):
++    def __init__(self, num_redundant_experts: int) -> None:
++        self.planner = LayerPlanner(num_redundant_experts)
++
++    def rebalance_experts(self, current_expert_table, expert_workload):
++        decision = self.planner.plan(
++            current_expert_table, expert_workload
++        )
++        return (
++            int(decision.should_apply),
++            np.asarray(decision.priority),
++            decision.placement,
++        )
++
++
++__all__ = ["LayerEplb"]
+diff --git a/vllm_ascend/eplb/eplb_updator.py b/vllm_ascend/eplb/eplb_updator.py
+index a9a8da605..0374d7103 100644
+--- a/vllm_ascend/eplb/eplb_updator.py
++++ b/vllm_ascend/eplb/eplb_updator.py
+@@ -15,6 +15,9 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this updator.
++import time
++from queue import Empty
++
+ import numpy
+ import torch
+ import torch.distributed as dist
+@@ -33,6 +36,7 @@ class EplbUpdator:
+     def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
+         self.eplb_config = eplb_config
+         self.multi_stage = eplb_config.eplb_policy_type == 3
++        self.global_slots = eplb_config.num_redundant_experts if eplb_config.uses_global_expert_pool else 0
+         self.init_eplb(self.eplb_config.expert_map_path, process)
+         self.eplb_loader = loader
+         self.eplb_process = eplb_process
+@@ -67,6 +71,16 @@ class EplbUpdator:
+ 
+         self.reqs = []
+         self.update_info_all = []
++        self.layer_update_plan_active = False
++        self.global_update_info = {}
++        self.update_plan_active = False
++        self.awaiting_plan = False
++        self.pending_update_info = None
++        self.global_update_steps = []
++        self.global_pending_step = None
++        self.global_transfer_reqs = []
++        self.global_total_steps = 0
++        self.global_plan_started_at = 0.0
+ 
+         self.cur_iterations: torch.int64 = 0
+ 
+@@ -87,6 +101,16 @@ class EplbUpdator:
+ 
+             self.adaptor.clear_all_moe_loads()
+             self.cur_iterations = 0
++            self.update_plan_active = False
++            self.awaiting_plan = False
++            self.pending_update_info = None
++            self.layer_update_plan_active = False
++            self.global_update_info = {}
++            self.global_update_steps = []
++            self.global_pending_step = None
++            self.global_transfer_reqs = []
++            self.global_total_steps = 0
++            self.global_plan_started_at = 0.0
+ 
+     def get_update_info_flag(self):
+         return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
+@@ -103,11 +127,64 @@ class EplbUpdator:
+     def wakeup_eplb_worker(self):
+         self.eplb_process.planner_q.put(1)
+ 
++    def _poll_global_update_plan(self) -> None:
++        if self.update_plan_active or not (self.get_update_info_flag() or self.awaiting_plan):
++            return
++
++        planner_state = 1
++        if self.pending_update_info is None:
++            try:
++                self.pending_update_info = self.eplb_process.block_update_q.get_nowait()
++            except Empty:
++                planner_state = 0 if self.process.is_alive() else -1
++
++        readiness = torch.tensor([planner_state], dtype=torch.int32, device=self.device)
++        dist.all_reduce(
++            readiness,
++            op=dist.ReduceOp.MIN,
++            group=self.comm_group.device_group,
++        )
++        global_state = int(readiness.item())
++        if global_state < 0:
++            raise RuntimeError("An EPLB planner exited before publishing an update plan")
++        if global_state == 0:
++            self.awaiting_plan = True
++            return
++
++        if not isinstance(self.pending_update_info, dict):
++            raise RuntimeError("EPLB policy 4 published an invalid update plan")
++        self.global_update_info = self.pending_update_info
++        self.pending_update_info = None
++        self.awaiting_plan = False
++        self.update_plan_active = bool(self.global_update_info.get("changed", False))
++        if self.update_plan_active:
++            self.global_update_steps = list(self.global_update_info.get("steps", []))
++            if not self.global_update_steps:
++                raise RuntimeError("EPLB policy 4 published a changed plan without migration steps")
++            self.global_total_steps = len(self.global_update_steps)
++            self.global_plan_started_at = time.perf_counter()
++
++    def _start_global_update_step(self) -> None:
++        if not self.update_plan_active or self.global_pending_step is not None:
++            return
++        # An eager kernel from the preceding iteration may still read a shared
++        # slot. Drain it before changing maps or writing that slot via HCCL.
++        torch.npu.current_stream().synchronize()
++        self.global_pending_step = self.global_update_steps.pop(0)
++        self.eplb_loader.apply_global_map_updates(self.global_pending_step["deactivate"])
++        self.global_transfer_reqs = self.eplb_loader.start_global_slot_transfer(self.global_pending_step)
++
+     def forward_before(self):
++        if self.global_slots:
++            self._poll_global_update_plan()
++            self._start_global_update_step()
++            return
++
+         # Batch after eplb process being triggered, get update info provided by eplb process
+         if self.get_update_info_flag():
+             self.update_info_all = self.eplb_process.block_update_q.get()
+-        if self.update_expert_weight_flag():
++            self.layer_update_plan_active = bool(self.update_info_all)
++        if self.update_expert_weight_flag() and self.layer_update_plan_active:
+             with record_function_or_nullcontext("EPLB generate p2p task"):
+                 (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
+                     self.update_info_all.pop(0)
+@@ -132,14 +209,48 @@ class EplbUpdator:
+                 self.compute_and_set_moe_load()
+                 self.wakeup_eplb_worker()
+ 
+-        if self.update_expert_weight_flag() and self.expert_map_record_path is None:
++        if self.global_slots and self.global_pending_step is not None:
++            self.eplb_loader.finish_global_slot_transfer(
++                self.global_transfer_reqs,
++                self.global_pending_step,
++            )
++            self.global_pending_step = None
++            self.global_transfer_reqs = []
++            if not self.global_update_steps:
++                self.shared_dict["expert_maps"] = torch.tensor(
++                    self.global_update_info["global_maps"], dtype=torch.int32
++                )
++                self.update_plan_active = False
++                if self.rank_id == 0:
++                    logger.info(
++                        "[eplb/global] Migration completed steps=%s elapsed_ms=%.3f",
++                        self.global_total_steps,
++                        (time.perf_counter() - self.global_plan_started_at) * 1000.0,
++                    )
++
++        if (
++            not self.global_slots
++            and self.layer_update_plan_active
++            and self.update_expert_weight_flag()
++            and self.expert_map_record_path is None
++        ):
+             self.eplb_loader.update_expert_map_and_weight(self.reqs)
+ 
+         # One circle of eplb update includes expert_heat_collection_interval + algorithm_execution_interval
+         # + num_moe_layers (for weight update). In expert_heat_collection stage, we only update the counter
+         # when eplb_heat_collection_status is True. In later stages, the counter is always updated.
+         # TODO(Angazenn): Decouple algorithm execution && weight update with heat collection iterations.
+-        if self.cur_iterations >= self.expert_heat_collection_interval - 1 or eplb_heat_collection_status:
++        # Global-pool collectives need one clock across real and dummy DP
++        # steps. Local heat eligibility controls counters, not this clock.
++        if (
++            not self.awaiting_plan
++            and not (self.global_slots and self.update_plan_active)
++            and (
++                self.global_slots
++                or self.cur_iterations >= self.expert_heat_collection_interval - 1
++                or eplb_heat_collection_status
++            )
++        ):
+             self.update_iteration()
+ 
+     def compute_and_set_moe_load(self):
+@@ -156,6 +267,8 @@ class EplbUpdator:
+ 
+     def warm_up_eplb(self):
+         logger.info("[eplb/updator] Starting EPLB warm-up, rank=%s, world_size=%s", self.rank_id, self.world_size)
++        if not self.global_slots:
++            self.eplb_loader.initialize_redundant_expert_weights()
+         self.shared_dict["expert_maps"] = self.adaptor.get_global_expert_map()
+         self.compute_and_set_moe_load()
+ 
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index 648e9c202..8c1b0d99f 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -43,7 +43,12 @@ from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+ from vllm_ascend.lora.fused_moe import sync_lora_context
+ from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
+ from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
+-from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
++from vllm_ascend.ops.fused_moe.moe_comm_method import (
++    AllGatherCommImpl,
++    FusedExpertsResult,
++    get_moe_comm_method,
++    setup_moe_comm_method,
++)
+ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+ from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
+ from vllm_ascend.quantization.quant_type import QuantType
+@@ -429,7 +434,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+         placement_moe_config = copy(moe_config)
+         placement_moe_config.num_experts = moe_config.num_logical_experts + (n_shared_experts if mix_placement else 0)
+         allocated_redundancy = moe_config.num_experts - moe_config.num_logical_experts
+-        if eplb_config.num_redundant_experts not in (0, allocated_redundancy):
++        uses_global_slots = eplb_config.uses_global_expert_pool
++        self._uses_global_expert_pool = uses_global_slots
++        if uses_global_slots:
++            self._eplb_vllm_config = vllm_config
++        if not uses_global_slots and eplb_config.num_redundant_experts not in (0, allocated_redundancy):
+             raise ValueError(
+                 "Conflicting EPLB redundant expert counts: "
+                 f"allocated={allocated_redundancy}, Ascend={eplb_config.num_redundant_experts}."
+@@ -657,6 +666,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+ 
+     def get_eplb_parameter(self, name: str):
+         """Return an expert parameter from the refactored weight owner."""
++        expert_list = getattr(self.routed_experts, f"{name}_list", None)
++        if isinstance(expert_list, list):
++            return expert_list
+         return getattr(self.routed_experts, name)
+ 
+     def _maybe_reduce_shared_expert_output(
+@@ -734,6 +746,13 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+         # This approach may overlook some extreme scenarios.
+         enable_force_load_balance = _EXTRA_CTX.in_profile_run
+ 
++        if self._uses_global_expert_pool:
++            # Select by the actual layer capacity, not an inherited draft flag.
++            # Target and draft must use different counters and dispatch layouts.
++            _EXTRA_CTX.moe_comm_method = get_moe_comm_method(
++                _EXTRA_CTX.moe_comm_type, self.moe_config.num_local_experts
++            )
++
+         lora_context = getattr(self.routed_experts, "_ascend_moe_lora_context", None)
+         if lora_context is not None:
+             sync_lora_context(self._quant_method, lora_context)
+diff --git a/vllm_ascend/ops/fused_moe/moe_comm_method.py b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+index c165379f5..3b374943c 100644
+--- a/vllm_ascend/ops/fused_moe/moe_comm_method.py
++++ b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+@@ -16,6 +16,7 @@
+ from __future__ import annotations
+ 
+ from abc import ABC, abstractmethod
++from copy import copy
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -50,13 +51,28 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
+ from vllm_ascend.quantization.quant_type import QuantType
+ 
+ _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
++_GlobalPoolMoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+ 
+ 
+-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
+-    return _MoECommMethods.get(moe_comm_type)
++def get_moe_comm_method(
++    moe_comm_type: MoECommType | None, num_local_experts: int | None = None
++) -> MoECommMethod | None:
++    method = _MoECommMethods.get(moe_comm_type)
++    if num_local_experts is None or method is None:
++        return method
++    if method.moe_config.num_local_experts == num_local_experts:
++        return method
++    pooled = _GlobalPoolMoECommMethods.get(moe_comm_type)
++    if pooled is not None and pooled.moe_config.num_local_experts == num_local_experts:
++        return pooled
++    raise ValueError(f"No MoE communication layout for {moe_comm_type} with {num_local_experts} local experts")
+ 
+ 
+ def setup_moe_comm_method(moe_config):
++    # Layer configs are subsequently expanded for the target pool. Retain an
++    # independent base layout for a draft model that does not own shared slots.
++    moe_config = copy(moe_config)
++    _GlobalPoolMoECommMethods.clear()
+     if moe_config.ep_size > 1:
+         _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
+         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+@@ -66,6 +82,19 @@ def setup_moe_comm_method(moe_config):
+         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+ 
+ 
++def resize_moe_comm_expert_layout(num_experts: int, num_local_experts: int, *, moe_config=None) -> None:
++    """Build a separate target layout without mutating draft communication."""
++    pooled = {}
++    for kind, method in _MoECommMethods.items():
++        config = copy(moe_config if moe_config is not None else method.moe_config)
++        config.num_experts = num_experts
++        config.num_local_experts = num_local_experts
++        pooled[kind] = type(method)(config)
++    _GlobalPoolMoECommMethods.clear()
++    _GlobalPoolMoECommMethods.update(pooled)
++    logger.info("[eplb/global] Isolated target communication layout: experts=%s local=%s", num_experts, num_local_experts)
++
++
+ def set_gmmswigluquant_method():
+     from vllm_ascend.ascend_config import get_ascend_config
+ 
+diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+index 7d4cef54b..c0b72d71c 100644
+--- a/vllm_ascend/ops/fused_moe/token_dispatcher.py
++++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+@@ -78,6 +78,10 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
+     def set_lora_context(self, lora_context) -> None:
+         self.lora_context = lora_context
+ 
++    def resize_expert_layout(self, num_experts: int, num_local_experts: int) -> None:
++        """Update cached physical expert dimensions after weight loading."""
++        self.num_experts = int(num_experts)
++
+     @property
+     def ep_group(self):
+         """Get expert model parallel group."""
+@@ -364,6 +368,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
+         )
+ 
++    def resize_expert_layout(self, num_experts: int, num_local_experts: int) -> None:
++        super().resize_expert_layout(num_experts, num_local_experts)
++        self.num_experts_local = int(num_local_experts)
++
+     def token_dispatch(
+         self,
+         token_dispatch_input: MoETokenDispatchInput,
+@@ -406,10 +414,13 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+         if expert_map is not None:
+             global_num_experts = len(expert_map) + global_redundant_expert_num
+-            mask = expert_map[topk_ids] != -1
+-            topk_weights = topk_weights * mask
+             first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
+             last_expert_idx = first_expert_idx + self.num_experts_local
++            if token_dispatch_input.routing.log2phy is not None:
++                mask = (topk_ids >= first_expert_idx) & (topk_ids < last_expert_idx)
++            else:
++                mask = expert_map[topk_ids] != -1
++            topk_weights = topk_weights * mask
+         else:
+             first_expert_idx = 0
+             last_expert_idx = self.num_experts_local
+@@ -463,9 +474,23 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
+ 
+     def __init__(self, **kwargs):
+         super().__init__(**kwargs)
+-        self.num_local_experts = kwargs.get("num_local_experts", 0)
++        self._set_expert_layout(self.num_experts, kwargs.get("num_local_experts", 0))
++
++        # TODO: Try local_rank = ep_group.rank_in_group
++        local_rank = torch.distributed.get_rank(group=self.ep_group)
++        backend = self.ep_group._get_backend(torch.device("npu"))
++        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
++
++    def resize_expert_layout(self, num_experts: int, num_local_experts: int) -> None:
++        super().resize_expert_layout(num_experts, num_local_experts)
++        self._set_expert_layout(num_experts, num_local_experts)
++
++    def _set_expert_layout(self, num_experts: int, num_local_experts: int) -> None:
++        self.num_experts = int(num_experts)
++        self.num_local_experts = int(num_local_experts)
+ 
+         assert self.num_local_experts > 0, "Expected at least one expert"
++        self.expert_ids_per_ep_rank = None
+         if self.num_local_experts > 1:
+             self.expert_ids_per_ep_rank = torch.tensor(
+                 [i % self.num_local_experts for i in range(self.num_experts)],
+@@ -482,11 +507,6 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher[MoEAllToAllCombineMetadata]
+                 "local_expert_indices must be continuous"
+             )
+ 
+-        # TODO: Try local_rank = ep_group.rank_in_group
+-        local_rank = torch.distributed.get_rank(group=self.ep_group)
+-        backend = self.ep_group._get_backend(torch.device("npu"))
+-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+-
+     def token_dispatch(
+         self,
+         token_dispatch_input: MoETokenDispatchInput,
+diff --git a/vllm_ascend/patch/platform/patch_fused_moe.py b/vllm_ascend/patch/platform/patch_fused_moe.py
+index d32979e0c..533f746d3 100644
+--- a/vllm_ascend/patch/platform/patch_fused_moe.py
++++ b/vllm_ascend/patch/platform/patch_fused_moe.py
+@@ -65,9 +65,16 @@ def _ascend_FusedMoE(*args, runner_cls=None, runner_args=None, **kwargs):
+     # constructed. Propagate Ascend EPLB capacity into the upstream factory so
+     # redundant expert slots are present when weights are created and loaded.
+     eplb_config = get_ascend_config().eplb_config
+-    if eplb_config.dynamic_eplb or eplb_config.expert_map_path is not None:
+-        configured_redundancy = eplb_config.num_redundant_experts
++    use_ascend_eplb = eplb_config.dynamic_eplb or eplb_config.expert_map_path is not None
++    if use_ascend_eplb:
++        uses_global_slots = eplb_config.uses_global_expert_pool
++        configured_redundancy = 0 if uses_global_slots else eplb_config.num_redundant_experts
+         upstream_redundancy = kwargs.get("num_redundant_experts", 0)
++        if uses_global_slots and upstream_redundancy:
++            raise ValueError(
++                "EPLB policy 4 owns a cross-layer expert pool and cannot be "
++                "combined with upstream per-layer redundant experts."
++            )
+         if configured_redundancy and upstream_redundancy not in (0, configured_redundancy):
+             raise ValueError(
+                 f"Conflicting EPLB redundant expert counts: vLLM={upstream_redundancy}, Ascend={configured_redundancy}."
+diff --git a/vllm_ascend/spec_decode/dspark_proposer.py b/vllm_ascend/spec_decode/dspark_proposer.py
+index e4c36e9e6..1151da034 100644
+--- a/vllm_ascend/spec_decode/dspark_proposer.py
++++ b/vllm_ascend/spec_decode/dspark_proposer.py
+@@ -397,6 +397,8 @@ class AscendDSparkProposer(AscendDflashProposer):
+         context_states = self.hidden_states[:num_input_tokens]
+ 
+         self.token_indices_to_sample.fill_(0)
++        # Padding also reads the context length on the first dummy invocation.
++        self._dflash_num_context = num_input_tokens
+         self._pad_draft_buffers(num_query_total, num_input_tokens)
+ 
+         with set_ascend_forward_context(
+@@ -420,7 +422,6 @@ class AscendDSparkProposer(AscendDflashProposer):
+                 )
+ 
+             else:
+-                self._dflash_num_context = num_input_tokens
+                 self._runnable(
+                     num_input_tokens=num_input_tokens,
+                     batch_size=num_reqs,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index f528043f9..fe9a99842 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -504,14 +504,26 @@ class NPUModelRunner(GPUModelRunner):
+         if self.dynamic_eplb:
+             self.is_eplb_warmuped = False
+             self.policy_type = eplb_config.eplb_policy_type
++            if eplb_config.uses_global_expert_pool:
++                if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
++                    raise ValueError("EPLB policy 4 on a prefill node currently requires eager mode")
+             self.eplb_loader = D2DExpertWeightLoader()
+             self.manager = Manager()
+             self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
++            policy_config = (
++                {
++                    "num_redundant_experts": eplb_config.num_redundant_experts,
++                    "node_role": eplb_config.eplb_node_role,
++                }
++                if self.policy_type == 4
++                else None
++            )
+             self.eplb_process = EplbProcess(
+                 shared_dict=self.shared_dict,
+                 policy_type=self.policy_type,
+                 enable_d2d=True,
+                 tp_size=self.parallel_config.tensor_parallel_size,
++                policy_config=policy_config,
+             )
+             self.process = self.eplb_process._launch_process()
+             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
+@@ -3281,7 +3293,7 @@ class NPUModelRunner(GPUModelRunner):
+         assert sum(num_scheduled_tokens_list) == num_tokens
+         assert len(num_scheduled_tokens_list) == num_reqs
+ 
+-        if not is_profile and self.dynamic_eplb:
++        if not is_profile and self.dynamic_eplb and not self.eplb_updator.global_slots:
+             self.eplb_updator.forward_before()
+ 
+         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+@@ -3333,6 +3345,12 @@ class NPUModelRunner(GPUModelRunner):
+         
+         if self.dynamic_eplb:
+             self.update_eplb_heat_collection_status(num_tokens_padded)
++            if self.eplb_updator.global_slots:
++                # Match execute_model: DP coordination must precede EPLB
++                # collectives, including when this DP rank has no requests.
++                self.eplb_heat_collection_status = False
++                if not is_profile:
++                    self.eplb_updator.forward_before()
+         
+         # vllm-ascend does not support ubatch now
+         ubatch_slices, ubatch_slices_padded = None, None
