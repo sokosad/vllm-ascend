@@ -838,6 +838,7 @@ class EplbConfig:
         "num_redundant_experts": 0,
         "eplb_policy_type": 2,
         "eplb_heat_collection_stage": "all",
+        "eplb_node_role": "prefill",
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -858,6 +859,10 @@ class EplbConfig:
             return self.config[key]
         raise AttributeError(f"Config has no attribute '{key}'")
 
+    @property
+    def uses_global_expert_pool(self) -> bool:
+        return self.dynamic_eplb and self.eplb_policy_type == 4 and self.eplb_node_role == "prefill"
+
     def _validate_config(self):
         if self.expert_map_path is not None:
             logger.info("The expert_map is %s", self.expert_map_path)
@@ -876,8 +881,21 @@ class EplbConfig:
                 raise TypeError(f"{key} must be an integer")
             if self.config[key] < 0:  # type: ignore
                 raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
-        if self.eplb_policy_type not in [0, 1, 2, 3]:
-            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+        if self.eplb_policy_type not in [0, 1, 2, 3, 4]:
+            raise ValueError("eplb_policy_type must be one of [0, 1, 2, 3, 4]")
+        if self.eplb_node_role not in ["prefill", "decode"]:
+            raise ValueError('eplb_node_role must be one of ["prefill", "decode"]')
+        if self.eplb_policy_type == 4:
+            if not self.dynamic_eplb:
+                raise ValueError("eplb_policy_type 4 requires dynamic_eplb")
+            if self.num_redundant_experts <= 0:
+                raise ValueError("eplb_policy_type 4 requires a positive num_redundant_experts")
+            if self.eplb_heat_collection_stage == "all":
+                self.config["eplb_heat_collection_stage"] = self.eplb_node_role
+            # Per-layer Policy4 can also balance a P node using prefill heat.
+            # Keep global-pool collection restricted to its prefill contract.
+            elif self.uses_global_expert_pool and self.eplb_heat_collection_stage != "prefill":
+                raise ValueError("Policy4 global expert pool requires prefill heat collection")
         if self.config["dynamic_eplb"]:
             assert (
                 os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1")

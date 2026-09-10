@@ -65,9 +65,16 @@ def _ascend_FusedMoE(*args, runner_cls=None, runner_args=None, **kwargs):
     # constructed. Propagate Ascend EPLB capacity into the upstream factory so
     # redundant expert slots are present when weights are created and loaded.
     eplb_config = get_ascend_config().eplb_config
-    if eplb_config.dynamic_eplb or eplb_config.expert_map_path is not None:
-        configured_redundancy = eplb_config.num_redundant_experts
+    use_ascend_eplb = eplb_config.dynamic_eplb or eplb_config.expert_map_path is not None
+    if use_ascend_eplb:
+        uses_global_slots = eplb_config.uses_global_expert_pool
+        configured_redundancy = 0 if uses_global_slots else eplb_config.num_redundant_experts
         upstream_redundancy = kwargs.get("num_redundant_experts", 0)
+        if uses_global_slots and upstream_redundancy:
+            raise ValueError(
+                "EPLB policy 4 owns a cross-layer expert pool and cannot be "
+                "combined with upstream per-layer redundant experts."
+            )
         if configured_redundancy and upstream_redundancy not in (0, configured_redundancy):
             raise ValueError(
                 f"Conflicting EPLB redundant expert counts: vLLM={upstream_redundancy}, Ascend={configured_redundancy}."

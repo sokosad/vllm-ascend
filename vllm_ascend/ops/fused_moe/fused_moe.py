@@ -43,7 +43,12 @@ from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.lora.fused_moe import sync_lora_context
 from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
-from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
+from vllm_ascend.ops.fused_moe.moe_comm_method import (
+    AllGatherCommImpl,
+    FusedExpertsResult,
+    get_moe_comm_method,
+    setup_moe_comm_method,
+)
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
@@ -429,7 +434,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         placement_moe_config = copy(moe_config)
         placement_moe_config.num_experts = moe_config.num_logical_experts + (n_shared_experts if mix_placement else 0)
         allocated_redundancy = moe_config.num_experts - moe_config.num_logical_experts
-        if eplb_config.num_redundant_experts not in (0, allocated_redundancy):
+        uses_global_slots = eplb_config.uses_global_expert_pool
+        self._uses_global_expert_pool = uses_global_slots
+        if uses_global_slots:
+            self._eplb_vllm_config = vllm_config
+        if not uses_global_slots and eplb_config.num_redundant_experts not in (0, allocated_redundancy):
             raise ValueError(
                 "Conflicting EPLB redundant expert counts: "
                 f"allocated={allocated_redundancy}, Ascend={eplb_config.num_redundant_experts}."
@@ -657,6 +666,9 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
 
     def get_eplb_parameter(self, name: str):
         """Return an expert parameter from the refactored weight owner."""
+        expert_list = getattr(self.routed_experts, f"{name}_list", None)
+        if isinstance(expert_list, list):
+            return expert_list
         return getattr(self.routed_experts, name)
 
     def _maybe_reduce_shared_expert_output(
@@ -733,6 +745,13 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # TODO: The community only considers load balancing when DP > 1.
         # This approach may overlook some extreme scenarios.
         enable_force_load_balance = _EXTRA_CTX.in_profile_run
+
+        if self._uses_global_expert_pool:
+            # Select by the actual layer capacity, not an inherited draft flag.
+            # Target and draft must use different counters and dispatch layouts.
+            _EXTRA_CTX.moe_comm_method = get_moe_comm_method(
+                _EXTRA_CTX.moe_comm_type, self.moe_config.num_local_experts
+            )
 
         lora_context = getattr(self.routed_experts, "_ascend_moe_lora_context", None)
         if lora_context is not None:

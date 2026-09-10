@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import copy
 from dataclasses import dataclass
 
 import torch
@@ -50,13 +51,28 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+_GlobalPoolMoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
-    return _MoECommMethods.get(moe_comm_type)
+def get_moe_comm_method(
+    moe_comm_type: MoECommType | None, num_local_experts: int | None = None
+) -> MoECommMethod | None:
+    method = _MoECommMethods.get(moe_comm_type)
+    if num_local_experts is None or method is None:
+        return method
+    if method.moe_config.num_local_experts == num_local_experts:
+        return method
+    pooled = _GlobalPoolMoECommMethods.get(moe_comm_type)
+    if pooled is not None and pooled.moe_config.num_local_experts == num_local_experts:
+        return pooled
+    raise ValueError(f"No MoE communication layout for {moe_comm_type} with {num_local_experts} local experts")
 
 
 def setup_moe_comm_method(moe_config):
+    # Layer configs are subsequently expanded for the target pool. Retain an
+    # independent base layout for a draft model that does not own shared slots.
+    moe_config = copy(moe_config)
+    _GlobalPoolMoECommMethods.clear()
     if moe_config.ep_size > 1:
         _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
@@ -64,6 +80,19 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
     else:
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+
+
+def resize_moe_comm_expert_layout(num_experts: int, num_local_experts: int, *, moe_config=None) -> None:
+    """Build a separate target layout without mutating draft communication."""
+    pooled = {}
+    for kind, method in _MoECommMethods.items():
+        config = copy(moe_config if moe_config is not None else method.moe_config)
+        config.num_experts = num_experts
+        config.num_local_experts = num_local_experts
+        pooled[kind] = type(method)(config)
+    _GlobalPoolMoECommMethods.clear()
+    _GlobalPoolMoECommMethods.update(pooled)
+    logger.info("[eplb/global] Isolated target communication layout: experts=%s local=%s", num_experts, num_local_experts)
 
 
 def set_gmmswigluquant_method():

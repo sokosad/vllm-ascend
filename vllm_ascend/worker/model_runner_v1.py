@@ -504,14 +504,26 @@ class NPUModelRunner(GPUModelRunner):
         if self.dynamic_eplb:
             self.is_eplb_warmuped = False
             self.policy_type = eplb_config.eplb_policy_type
+            if eplb_config.uses_global_expert_pool:
+                if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                    raise ValueError("EPLB policy 4 on a prefill node currently requires eager mode")
             self.eplb_loader = D2DExpertWeightLoader()
             self.manager = Manager()
             self.shared_dict = self.manager.dict({"expert_map": None, "moe_load": None, "expert_maps": None})
+            policy_config = (
+                {
+                    "num_redundant_experts": eplb_config.num_redundant_experts,
+                    "node_role": eplb_config.eplb_node_role,
+                }
+                if self.policy_type == 4
+                else None
+            )
             self.eplb_process = EplbProcess(
                 shared_dict=self.shared_dict,
                 policy_type=self.policy_type,
                 enable_d2d=True,
                 tp_size=self.parallel_config.tensor_parallel_size,
+                policy_config=policy_config,
             )
             self.process = self.eplb_process._launch_process()
             self.eplb_updator = EplbUpdator(eplb_config, self.eplb_loader, self.eplb_process, self.process)
@@ -3281,7 +3293,7 @@ class NPUModelRunner(GPUModelRunner):
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
 
-        if not is_profile and self.dynamic_eplb:
+        if not is_profile and self.dynamic_eplb and not self.eplb_updator.global_slots:
             self.eplb_updator.forward_before()
 
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
@@ -3333,6 +3345,12 @@ class NPUModelRunner(GPUModelRunner):
         
         if self.dynamic_eplb:
             self.update_eplb_heat_collection_status(num_tokens_padded)
+            if self.eplb_updator.global_slots:
+                # Match execute_model: DP coordination must precede EPLB
+                # collectives, including when this DP rank has no requests.
+                self.eplb_heat_collection_status = False
+                if not is_profile:
+                    self.eplb_updator.forward_before()
         
         # vllm-ascend does not support ubatch now
         ubatch_slices, ubatch_slices_padded = None, None

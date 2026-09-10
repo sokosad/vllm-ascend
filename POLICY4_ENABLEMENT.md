@@ -1,0 +1,133 @@
+# Policy4 enablement: DSV4 v0.26 P/D
+
+## Scope and provenance
+
+- Branch: `feature/policy4-dsv4-pd-20260910`.
+- Repository: `https://github.com/sokosad/vllm-ascend`.
+- Upstream base: `85625bd772f27a4a13bc8e548f131af5ce3ff734`.
+- Python source extracted from the September 10 DSV4 experiment runtime.
+- Both prefill global-pool and decode per-layer Policy4 are retained.
+- Includes target/draft communication-layout isolation, expert weight/scale
+  migration, routing-aware placement and DSpark dummy-context initialization.
+- Experiment-only NPZ/JSONL writes to a hardcoded temporary directory are removed.
+  Plan application and migration-completion logging remain.
+- No model weights, compiled binaries, datasets, credentials or benchmark logs
+  are included. Existing upstream tests are not removed.
+
+## Install in a compatible container
+
+Use the tested v0.26 DSV4 environment and its matching vLLM, torch-npu, CANN and
+custom kernels. This branch is not a v0.23/GLM compatibility release. Do not reuse
+binary extensions from an unrelated image or Python ABI.
+
+```bash
+git clone --branch feature/policy4-dsv4-pd-20260910 --single-branch \
+  https://github.com/sokosad/vllm-ascend.git policy4-dsv4
+cd policy4-dsv4
+python -m pip install --no-deps --no-build-isolation -e .
+```
+
+The editable installation may build extensions and requires the image's build
+prerequisites. No separate Policy4 patch or assembled runtime directory is
+required. In a fresh launch shell, remove stale experiment-runtime entries from
+`PYTHONPATH`; otherwise they can override this checkout. Do not change the
+installed code underneath an active service; install and restart during your
+allocated time.
+
+## P node: tested global pool
+
+Keep the existing launch script, topology, KV connector, ports, model, cache,
+batch, proxy and benchmark settings. Replace only the `eplb_config` member in
+its existing `--additional-config` JSON. Do not replace unrelated JSON members.
+
+```bash
+export DYNAMIC_EPLB=True
+```
+
+```json
+{
+  "dynamic_eplb": true,
+  "eplb_policy_type": 4,
+  "eplb_node_role": "prefill",
+  "eplb_heat_collection_stage": "prefill",
+  "expert_heat_collection_interval": 400,
+  "algorithm_execution_interval": 50,
+  "num_redundant_experts": 22
+}
+```
+
+Keep `--enable-expert-parallel` and `--enforce-eager`. The tested P configuration
+used DP4/TP4/EP16, W8A8 DSV4, DSpark with five speculative tokens and eager draft,
+8192 batched tokens and 64 sequences. It used fused MC2 enabled in the existing
+script (`VLLM_ASCEND_ENABLE_FUSED_MC2=1`). This v0.26 base also accepts the top-level
+additional-config member `"enable_fused_mc2": 1`; do not introduce contradictory
+environment and JSON settings. No general graph-mode compatibility is claimed
+for the prefill global pool.
+
+Here `num_redundant_experts=22` means **22 shared redundant slots per EP rank
+across all target MoE layers**, not 22 per layer. EP16 gives 352 redundant slots.
+The reference Policy2 configuration uses 16 redundant copies per layer across
+EP ranks: 43 layers give 688 copies. Neither figure is total-device memory usage.
+Target-model shared-pool capacity is not assigned to the independent draft model.
+
+## D node: retained optional per-layer Policy4
+
+The September 10 comparison kept D EPLB disabled in both runs. To reproduce its
+results, leave D unchanged. The following is a separate opt-in configuration,
+not a configuration validated by that performance run:
+
+```bash
+export DYNAMIC_EPLB=True
+```
+
+Merge this `eplb_config` object into the original additional config:
+
+```json
+{
+  "dynamic_eplb": true,
+  "eplb_policy_type": 4,
+  "eplb_node_role": "decode",
+  "eplb_heat_collection_stage": "decode",
+  "expert_heat_collection_interval": 600,
+  "algorithm_execution_interval": 50,
+  "num_redundant_experts": 16
+}
+```
+
+In decode mode the redundant count is per layer across EP ranks, not a shared
+cross-layer pool. Choose a count compatible with your EP layout; 16 is an EP16
+example, not an optimum for every topology. Validate the exact D graph/fused
+configuration separately before performance comparisons. This release does not
+claim D FULL_DECODE_ONLY, accuracy or performance validation from the P-only run.
+
+## Observe activation
+
+Redirect the existing launch script's output to a service log, then inspect:
+
+```bash
+grep -E 'Policy:|eplb/global|Apply plan|Migration completed' service.log
+```
+
+An initialized communication layout alone does not prove shared slots were
+used. `Apply plan` means a placement was accepted; `Migration completed` confirms
+completion of the scheduled migration. Heat collection uses inference-iteration
+windows, not completed-request counts. Stable-window and gain gates can delay
+or skip migration. `insufficient_gain` retains the currently active placement.
+Diagnostic skip messages use DEBUG and are not necessarily visible at INFO.
+The experiment's detailed slot-utilization JSONL is not generated by this cleaned
+branch. Historical evidence is retained separately; do not expect its temporary
+paths to appear in a new deployment.
+
+## Validation boundary
+
+The source runtime completed one 8000-request P-only Policy4 comparison with
+7956 successes and 44 failures. One migration completed; two post-migration
+windows observed all 352 shared slots hit and mean imbalance around 1.13.
+The original Policy2 run had 7951 successes and 49 failures. Output throughput
+was 1111.273 -> 1150.869 token/s, mean TTFT 9960.715 -> 9466.730 ms and mean TPOT
+27.603 -> 27.883 ms. These are single-run observations with failed requests and
+tail effects, not a clean repeated performance or accuracy certification.
+
+The diagnostic-free extraction has not been re-benchmarked. No new tests or
+remote service starts were performed for this packaging task. P/D enablement
+are separate choices; do not attribute the P-only result to D Policy4.

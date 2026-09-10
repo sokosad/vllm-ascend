@@ -397,6 +397,8 @@ class AscendDSparkProposer(AscendDflashProposer):
         context_states = self.hidden_states[:num_input_tokens]
 
         self.token_indices_to_sample.fill_(0)
+        # Padding also reads the context length on the first dummy invocation.
+        self._dflash_num_context = num_input_tokens
         self._pad_draft_buffers(num_query_total, num_input_tokens)
 
         with set_ascend_forward_context(
@@ -420,7 +422,6 @@ class AscendDSparkProposer(AscendDflashProposer):
                 )
 
             else:
-                self._dflash_num_context = num_input_tokens
                 self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=num_reqs,
