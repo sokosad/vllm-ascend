@@ -1966,7 +1966,7 @@ index 000000000..99fb1e06e
 +
 +__all__ = ["LayerEplb"]
 diff --git a/vllm_ascend/eplb/eplb_updator.py b/vllm_ascend/eplb/eplb_updator.py
-index a9a8da605..0374d7103 100644
+index a9a8da605..c5140c433 100644
 --- a/vllm_ascend/eplb/eplb_updator.py
 +++ b/vllm_ascend/eplb/eplb_updator.py
 @@ -15,6 +15,9 @@
@@ -1979,7 +1979,14 @@ index a9a8da605..0374d7103 100644
  import numpy
  import torch
  import torch.distributed as dist
-@@ -33,6 +36,7 @@ class EplbUpdator:
+@@ -28,11 +31,14 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
+ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
+ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+ 
++_GLOBAL_STARTUP_HEAT_INTERVAL = 200
++
+ 
+ class EplbUpdator:
      def __init__(self, eplb_config, loader: D2DExpertWeightLoader, eplb_process: EplbProcess, process):
          self.eplb_config = eplb_config
          self.multi_stage = eplb_config.eplb_policy_type == 3
@@ -1987,7 +1994,20 @@ index a9a8da605..0374d7103 100644
          self.init_eplb(self.eplb_config.expert_map_path, process)
          self.eplb_loader = loader
          self.eplb_process = eplb_process
-@@ -67,6 +71,16 @@ class EplbUpdator:
+@@ -53,6 +59,12 @@ class EplbUpdator:
+         self.num_expert_load_gather = 10
+         self.periodic_load_gather = True
+         self.expert_heat_collection_interval: torch.int64 = self.eplb_config.expert_heat_collection_interval
++        self.steady_heat_collection_interval = self.expert_heat_collection_interval
++        self.startup_migration_completed = False
++        if self.global_slots:
++            self.expert_heat_collection_interval = min(
++                self.steady_heat_collection_interval, _GLOBAL_STARTUP_HEAT_INTERVAL
++            )
+         self.expert_map_path = expert_map_path
+         self.expert_map_record_path = self.eplb_config.expert_map_record_path
+ 
+@@ -67,6 +79,16 @@ class EplbUpdator:
  
          self.reqs = []
          self.update_info_all = []
@@ -2004,7 +2024,20 @@ index a9a8da605..0374d7103 100644
  
          self.cur_iterations: torch.int64 = 0
  
-@@ -87,6 +101,16 @@ class EplbUpdator:
+@@ -75,6 +97,12 @@ class EplbUpdator:
+         self.process = process
+ 
+         logger.info("[eplb/updator] Launched EPLB subprocess, pid=%s", self.process.pid)
++        if self.global_slots and self.rank_id == 0:
++            logger.info(
++                "[eplb/global] Startup heat interval=%s steady_interval=%s",
++                self.expert_heat_collection_interval,
++                self.steady_heat_collection_interval,
++            )
+ 
+     def update_iteration(self):
+         self.cur_iterations += 1
+@@ -87,6 +115,30 @@ class EplbUpdator:
  
              self.adaptor.clear_all_moe_loads()
              self.cur_iterations = 0
@@ -2018,10 +2051,24 @@ index a9a8da605..0374d7103 100644
 +            self.global_transfer_reqs = []
 +            self.global_total_steps = 0
 +            self.global_plan_started_at = 0.0
++
++            # Keep the old clock through migration and reset. Changing its
++            # threshold mid-cycle could wake the planner again on stale heat.
++            if self.startup_migration_completed:
++                self.startup_migration_completed = False
++                previous_interval = self.expert_heat_collection_interval
++                self.expert_heat_collection_interval = self.steady_heat_collection_interval
++                if not self.periodic_load_gather:
++                    self.num_expert_load_gather = self.expert_heat_collection_interval
++                if self.rank_id == 0 and previous_interval != self.expert_heat_collection_interval:
++                    logger.info(
++                        "[eplb/global] Restored steady heat interval=%s after completed migration",
++                        self.expert_heat_collection_interval,
++                    )
  
      def get_update_info_flag(self):
          return self.cur_iterations == (self.expert_heat_collection_interval + self.algorithm_execution_interval - 1)
-@@ -103,11 +127,64 @@ class EplbUpdator:
+@@ -103,11 +155,64 @@ class EplbUpdator:
      def wakeup_eplb_worker(self):
          self.eplb_process.planner_q.put(1)
  
@@ -2087,7 +2134,7 @@ index a9a8da605..0374d7103 100644
              with record_function_or_nullcontext("EPLB generate p2p task"):
                  (expert_send_info, expert_recv_info, updated_expert_map, log2phy_map, layer_id) = (
                      self.update_info_all.pop(0)
-@@ -132,14 +209,48 @@ class EplbUpdator:
+@@ -132,14 +237,51 @@ class EplbUpdator:
                  self.compute_and_set_moe_load()
                  self.wakeup_eplb_worker()
  
@@ -2104,6 +2151,9 @@ index a9a8da605..0374d7103 100644
 +                    self.global_update_info["global_maps"], dtype=torch.int32
 +                )
 +                self.update_plan_active = False
++                self.startup_migration_completed = (
++                    self.expert_heat_collection_interval != self.steady_heat_collection_interval
++                )
 +                if self.rank_id == 0:
 +                    logger.info(
 +                        "[eplb/global] Migration completed steps=%s elapsed_ms=%.3f",
@@ -2138,7 +2188,7 @@ index a9a8da605..0374d7103 100644
              self.update_iteration()
  
      def compute_and_set_moe_load(self):
-@@ -156,6 +267,8 @@ class EplbUpdator:
+@@ -156,6 +298,8 @@ class EplbUpdator:
  
      def warm_up_eplb(self):
          logger.info("[eplb/updator] Starting EPLB warm-up, rank=%s, world_size=%s", self.rank_id, self.world_size)
